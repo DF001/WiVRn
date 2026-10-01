@@ -54,6 +54,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <magic_enum.hpp>
 #include <multi/comp_multi_interface.h>
 #include <stdexcept>
@@ -487,7 +490,7 @@ float wivrn_session::default_fps()
 	auto s = settings.lock();
 	if (s->preferred_refresh_rate)
 		return s->preferred_refresh_rate / s->fps_divider;
-	return headset_info.available_refresh_rates.back();
+	return headset_info.available_refresh_rates.back() / s->fps_divider;
 }
 
 void wivrn_session::add_tracking_request(device_id device, int64_t at_ns, int64_t produced_ns, int64_t now)
@@ -1011,13 +1014,40 @@ struct refresh_rate_adjuster
 	pacing_app_factory & pacers;
 	const from_headset::headset_info_packet & info;
 	thread_safe<from_headset::settings_changed> & settings;
+	wivrn::compositor & comp;
 	float last = 0;
 
-	refresh_rate_adjuster(const from_headset::headset_info_packet & info, thread_safe<from_headset::settings_changed> & settings, pacing_app_factory & pacers) :
+	bool frame_v3 = false;
+	uint32_t frame_divider = 1;
+	uint32_t pending_divider = 1;
+	unsigned pending_count = 0;
+
+	refresh_rate_adjuster(const from_headset::headset_info_packet & info,
+	                      thread_safe<from_headset::settings_changed> & settings,
+	                      pacing_app_factory & pacers,
+	                      wivrn::compositor & comp) :
 	        pacers(pacers),
 	        info(info),
-	        settings(settings)
-	{}
+	        settings(settings),
+	        comp(comp)
+	{
+		auto locked = settings.lock();
+		frame_divider = std::clamp(locked->fps_divider, 1u, 3u);
+		pending_divider = frame_divider;
+
+		const char * enabled = std::getenv("WIVRN_FRAME_V3");
+		frame_v3 =
+		        enabled && std::strcmp(enabled, "0") != 0 &&
+		        info.available_refresh_rates.size() == 1 &&
+		        std::abs(info.available_refresh_rates.front() - 144.0f) < 2.0f;
+
+		if (frame_v3)
+		{
+			period = std::chrono::seconds{2};
+			next = std::chrono::steady_clock::now() + period;
+			U_LOG_I("Steam Frame v3 adaptive cadence enabled (144/72/48)");
+		}
+	}
 
 	bool advance(std::chrono::steady_clock::time_point now)
 	{
@@ -1027,8 +1057,80 @@ struct refresh_rate_adjuster
 		return true;
 	}
 
+	void adjust_frame_v3()
+	{
+		const float panel_rate = info.available_refresh_rates.front();
+		const float app_rate = float(U_TIME_1S_IN_NS) / pacers.get_frame_time();
+
+		uint32_t desired = frame_divider;
+		switch (frame_divider)
+		{
+			case 1:
+				// Prefer exact 2:1 cadence if the application cannot remain
+				// close to native 144 Hz.
+				if (app_rate < 132.0f)
+					desired = 2;
+				break;
+			case 2:
+				// 72 -> 48 when even the 2:1 cadence has insufficient margin.
+				if (app_rate < 60.0f)
+					desired = 3;
+				// Probe native after sustained operation at/near the 72 cap.
+				else if (app_rate >= 70.0f)
+					desired = 1;
+				break;
+			default:
+				// Probe 72 after sustained operation at/near the 48 cap.
+				frame_divider = 3;
+				if (app_rate >= 47.0f)
+					desired = 2;
+				break;
+		}
+
+		if (desired == frame_divider)
+		{
+			pending_divider = frame_divider;
+			pending_count = 0;
+			return;
+		}
+
+		if (pending_divider != desired)
+		{
+			pending_divider = desired;
+			pending_count = 1;
+			return;
+		}
+
+		++pending_count;
+		// Downshift quickly (4 s) to protect latency/frame delivery.
+		// Upshift conservatively (20 s) to avoid cadence oscillation.
+		const unsigned required = desired > frame_divider ? 2 : 10;
+		if (pending_count < required)
+			return;
+
+		frame_divider = desired;
+		pending_divider = desired;
+		pending_count = 0;
+
+		{
+			auto locked = settings.lock();
+			locked->fps_divider = frame_divider;
+		}
+
+		const float target = panel_rate / frame_divider;
+		comp.set_framerate(target);
+		U_LOG_I("Steam Frame v3 cadence: %.0f Hz panel -> %.0f FPS (%u:1), app rate %.1f",
+		        panel_rate, target, frame_divider, app_rate);
+	}
+
 	void adjust(wivrn_connection & cnx)
 	{
+		if (frame_v3)
+		{
+			adjust_frame_v3();
+			return;
+		}
+
 		auto locked = settings.lock();
 		if (locked->preferred_refresh_rate != 0 or info.available_refresh_rates.size() < 2)
 			return;
@@ -1054,6 +1156,8 @@ struct refresh_rate_adjuster
 	void reset()
 	{
 		last = 0;
+		pending_divider = frame_divider;
+		pending_count = 0;
 	}
 };
 
@@ -1102,7 +1206,7 @@ void wivrn_session::run_net(std::stop_token stop)
 
 void wivrn_session::run_worker(std::stop_token stop)
 {
-	refresh_rate_adjuster refresh(get_info(), settings, app_pacers);
+	refresh_rate_adjuster refresh(get_info(), settings, app_pacers, compositor);
 	while (not stop.stop_requested())
 	{
 		try

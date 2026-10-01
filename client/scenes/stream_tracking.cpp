@@ -27,6 +27,10 @@
 #include "xr/to_string.h"
 #include <magic_enum.hpp>
 #include <magic_enum_containers.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <ranges>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -37,6 +41,116 @@
 
 namespace
 {
+
+bool frame_gaze_fix_enabled()
+{
+	static const bool enabled = [] {
+		const char * value = std::getenv("WIVRN_FRAME_GAZE_FIX");
+		return value && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+class frame_gaze_stabilizer
+{
+	std::optional<glm::quat> filtered;
+	XrTime last_timestamp = 0;
+	uint64_t samples = 0;
+	uint64_t saccade_bypasses = 0;
+	uint64_t micro_jitter_samples = 0;
+	XrTime next_log = 0;
+
+	static constexpr float micro_jitter_rad = 0.15f * M_PI / 180.0f;
+	static constexpr float saccade_rad = 2.5f * M_PI / 180.0f;
+	static constexpr double tau_seconds = 0.004;
+
+public:
+	void apply(from_headset::tracking::pose & pose, XrTime timestamp)
+	{
+		using flags = from_headset::pose_flags;
+		const uint8_t orientation_ok =
+		        uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked);
+		if ((pose.flags & orientation_ok) != orientation_ok)
+			return;
+
+		glm::quat raw(
+		        pose.pose.orientation.w,
+		        pose.pose.orientation.x,
+		        pose.pose.orientation.y,
+		        pose.pose.orientation.z);
+		raw = glm::normalize(raw);
+
+		if (not filtered)
+		{
+			filtered = raw;
+			last_timestamp = timestamp;
+		}
+		else
+		{
+			float d = glm::dot(*filtered, raw);
+			if (d < 0.0f)
+			{
+				raw = glm::quat(-raw.w, -raw.x, -raw.y, -raw.z);
+				d = -d;
+			}
+			d = std::clamp(d, 0.0f, 1.0f);
+			const float angle = 2.0f * std::acos(d);
+
+			double dt = last_timestamp > 0
+			                    ? double(timestamp - last_timestamp) / 1'000'000'000.0
+			                    : tau_seconds;
+			dt = std::clamp(dt, 0.0005, 0.050);
+
+			float alpha;
+			if (angle >= saccade_rad)
+			{
+				alpha = 1.0f;
+				++saccade_bypasses;
+			}
+			else
+			{
+				alpha = float(1.0 - std::exp(-dt / tau_seconds));
+				if (angle < micro_jitter_rad)
+				{
+					alpha *= 0.25f;
+					++micro_jitter_samples;
+				}
+				alpha = std::clamp(alpha, 0.03f, 1.0f);
+			}
+
+			glm::quat blended(
+			        filtered->w + alpha * (raw.w - filtered->w),
+			        filtered->x + alpha * (raw.x - filtered->x),
+			        filtered->y + alpha * (raw.y - filtered->y),
+			        filtered->z + alpha * (raw.z - filtered->z));
+			filtered = glm::normalize(blended);
+			last_timestamp = timestamp;
+		}
+
+		pose.pose.orientation = {
+		        .x = filtered->x,
+		        .y = filtered->y,
+		        .z = filtered->z,
+		        .w = filtered->w,
+		};
+
+		pose.angular_velocity = {};
+		pose.flags &= ~uint8_t(flags::angular_velocity_valid);
+		++samples;
+
+		if (next_log == 0)
+			next_log = timestamp + 5'000'000'000;
+		else if (timestamp >= next_log)
+		{
+			spdlog::info(
+			        "Steam Frame gaze hotfix: samples={}, saccade_bypass={}, micro_jitter={}",
+			        samples,
+			        saccade_bypasses,
+			        micro_jitter_samples);
+			next_log = timestamp + 5'000'000'000;
+		}
+	}
+};
 
 from_headset::tracking::pose locate_space(device_id device, XrSpace space, XrSpace reference, XrTime time)
 {
@@ -310,6 +424,10 @@ void scenes::stream::tracking()
 
 	XrDuration frame_duration{};
 	XrTime pattern_begin = instance.now();
+	frame_gaze_stabilizer gaze_stabilizer;
+
+	if (frame_gaze_fix_enabled())
+		spdlog::info("Steam Frame gaze hotfix active: stable reference + adaptive 4 ms jitter filter");
 
 	while (state_ != state::shutdown)
 	{
@@ -469,7 +587,7 @@ void scenes::stream::tracking()
 							break;
 						case wivrn::device_id::EYE_GAZE:
 							// Eye gaze uses view pose as the origin
-							if (application::get_hmd_traits().view_locate)
+							if (application::get_hmd_traits().view_locate and not frame_gaze_fix_enabled())
 								tracking.device_poses.push_back(locate_space(item.device, spaces[item.device], spaces[wivrn::device_id::HEAD], tracking.timestamp));
 							else
 							{
@@ -495,6 +613,10 @@ void scenes::stream::tracking()
 								                .flags = uint8_t(gaze.flags & view_pose.flags & ~(flags::linear_velocity_valid | flags::angular_velocity_valid)),
 								        });
 							}
+							if (frame_gaze_fix_enabled() and
+							    not tracking.device_poses.empty() and
+							    tracking.device_poses.back().device == wivrn::device_id::EYE_GAZE)
+								gaze_stabilizer.apply(tracking.device_poses.back(), tracking.timestamp);
 							break;
 						case wivrn::device_id::FACE:
 							std::visit(utils::overloaded{
