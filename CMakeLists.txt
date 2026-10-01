@@ -58,6 +58,10 @@ endif()
 option(WIVRN_USE_V4L2 "Enable V4L2 hardware video decoder" ${_WIVRN_USE_V4L2_DEFAULT})
 unset(_WIVRN_USE_V4L2_DEFAULT)
 
+# Experimental Steam Frame defaults. Kept OFF globally and enabled only by the
+# dedicated "frame" preset so other Linux/AArch64 V4L2 clients are unaffected.
+option(WIVRN_STEAM_FRAME_EXPERIMENTS "Default Steam Frame v3/gaze v2 experiments on" OFF)
+
 if(WIVRN_OPTIMIZE_SHADERS AND WIVRN_DEBUG_SHADERS)
     message(FATAL_ERROR "WIVRN_OPTIMIZE_SHADERS and WIVRN_DEBUG_SHADERS are incompatible")
 endif()

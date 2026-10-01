@@ -45,8 +45,9 @@ namespace
 bool frame_gaze_fix_enabled()
 {
 	static const bool enabled = [] {
-		const char * value = std::getenv("WIVRN_FRAME_GAZE_FIX");
-		return value && std::strcmp(value, "0") != 0;
+		if (const char * value = std::getenv("WIVRN_FRAME_GAZE_FIX"))
+			return std::strcmp(value, "0") != 0;
+		return bool(WIVRN_STEAM_FRAME_EXPERIMENTS);
 	}();
 	return enabled;
 }
@@ -60,9 +61,9 @@ class frame_gaze_stabilizer
 	uint64_t micro_jitter_samples = 0;
 	XrTime next_log = 0;
 
-	static constexpr float micro_jitter_rad = 0.15f * M_PI / 180.0f;
+	static constexpr float micro_jitter_rad = 0.30f * M_PI / 180.0f;
 	static constexpr float saccade_rad = 2.5f * M_PI / 180.0f;
-	static constexpr double tau_seconds = 0.004;
+	static constexpr double tau_seconds = 0.010;
 
 public:
 	void apply(from_headset::tracking::pose & pose, XrTime timestamp)
@@ -143,7 +144,7 @@ public:
 		else if (timestamp >= next_log)
 		{
 			spdlog::info(
-			        "Steam Frame gaze hotfix: samples={}, saccade_bypass={}, micro_jitter={}",
+			        "Steam Frame gaze v2: samples={}, saccade_bypass={}, micro_jitter={}",
 			        samples,
 			        saccade_bypasses,
 			        micro_jitter_samples);
@@ -427,7 +428,7 @@ void scenes::stream::tracking()
 	frame_gaze_stabilizer gaze_stabilizer;
 
 	if (frame_gaze_fix_enabled())
-		spdlog::info("Steam Frame gaze hotfix active: stable reference + adaptive 4 ms jitter filter");
+		spdlog::info("Steam Frame gaze v2 active: stable reference + adaptive 10 ms filter (micro=0.30 deg, saccade=2.50 deg)");
 
 	while (state_ != state::shutdown)
 	{

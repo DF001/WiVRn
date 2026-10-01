@@ -62,8 +62,9 @@ bool steam_frame_v3_enabled()
 {
 #if WIVRN_USE_V4L2
 	static const bool enabled = [] {
-		const char * value = std::getenv("WIVRN_FRAME_V3");
-		return value && std::strcmp(value, "0") != 0;
+		if (const char * value = std::getenv("WIVRN_FRAME_V3"))
+			return std::strcmp(value, "0") != 0;
+		return bool(WIVRN_STEAM_FRAME_EXPERIMENTS);
 	}();
 	return enabled;
 #else
