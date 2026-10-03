@@ -229,13 +229,13 @@ private:
 		{
 			case source::combined:
 				spdlog::info(
-				        "Steam Frame gaze v5 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v6 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::held:
 				spdlog::warn(
-				        "Steam Frame gaze v5 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v6 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
@@ -247,14 +247,14 @@ private:
 		fd = ::open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 		{
-			spdlog::warn("Steam Frame gaze v5: cannot open {}: {}", path, std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v6: cannot open {}: {}", path, std::strerror(errno));
 			return false;
 		}
 
 		struct stat st{};
 		if (fstat(fd, &st) != 0)
 		{
-			spdlog::warn("Steam Frame gaze v5: fstat failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v6: fstat failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -264,7 +264,7 @@ private:
 		if (size < expected_size)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v5: eye mmap too small ({} bytes, need at least {})",
+			        "Steam Frame gaze v6: eye mmap too small ({} bytes, need at least {})",
 			        size,
 			        expected_size);
 			::close(fd);
@@ -275,7 +275,7 @@ private:
 		void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (mapped == MAP_FAILED)
 		{
-			spdlog::warn("Steam Frame gaze v5: mmap failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v6: mmap failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -289,7 +289,7 @@ private:
 		if (version != supported_version or initialized != 1)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v5: unsupported eye mmap (version={}, initialized={})",
+			        "Steam Frame gaze v6: unsupported eye mmap (version={}, initialized={})",
 			        version,
 			        initialized);
 			munmap(data, size);
@@ -301,7 +301,7 @@ private:
 		}
 
 		spdlog::info(
-		        "Steam Frame gaze v5 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
+		        "Steam Frame gaze v6 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
 		return true;
 	}
 
@@ -491,21 +491,39 @@ class frame_gaze_stabilizer
 {
 	std::optional<glm::quat> fixation;
 	std::optional<glm::quat> first_outside;
-	XrTime last_update_frame = 0;
+	XrTime last_source_update_frame = 0;
 	uint64_t fixation_samples = 0;
 
+	std::optional<glm::quat> temporal_output;
+	XrTime last_temporal_frame = 0;
+	uint32_t temporal_fast_frames_remaining = 0;
+
 	uint64_t requests = 0;
-	uint64_t frame_updates = 0;
+	uint64_t source_updates = 0;
 	uint64_t held_requests = 0;
 	uint64_t fixation_samples_accepted = 0;
 	uint64_t stray_samples_rejected = 0;
 	uint64_t fixation_switches = 0;
 	uint64_t saccade_bypasses = 0;
+	uint64_t temporal_updates = 0;
+	uint64_t temporal_slow_updates = 0;
+	uint64_t temporal_medium_updates = 0;
+	uint64_t temporal_fast_updates = 0;
 	XrTime next_log = 0;
 
 	static constexpr float fixation_radius_rad = 2.75f * M_PI / 180.0f;
 	static constexpr float saccade_rad = 5.0f * M_PI / 180.0f;
 	static constexpr uint64_t max_fixation_samples = 90;
+
+	// Adaptive temporal smoothing runs once per Steam Frame display/tracking frame.
+	// Small residual motion gets strong smoothing, medium motion stays responsive,
+	// and a detected >=5 degree saccade gets three fast frames before returning
+	// to the normal adaptive bands.
+	static constexpr float temporal_slow_angle_rad = 1.0f * M_PI / 180.0f;
+	static constexpr float temporal_slow_tau_seconds = 0.050f;
+	static constexpr float temporal_medium_tau_seconds = 0.025f;
+	static constexpr float temporal_fast_tau_seconds = 0.008f;
+	static constexpr uint32_t temporal_fast_frames_after_saccade = 3;
 
 	static glm::quat align_hemisphere(const glm::quat & reference, glm::quat value)
 	{
@@ -571,11 +589,75 @@ class frame_gaze_stabilizer
 		++fixation_switches;
 	}
 
+	void advance_temporal(XrTime temporal_frame_key)
+	{
+		if (not fixation)
+		{
+			return;
+		}
+
+		if (not temporal_output)
+		{
+			temporal_output = *fixation;
+			last_temporal_frame = temporal_frame_key;
+			++temporal_updates;
+			return;
+		}
+
+		if (temporal_frame_key == last_temporal_frame)
+		{
+			return;
+		}
+
+		if (temporal_frame_key < last_temporal_frame)
+		{
+			// A tracking-pattern reset must never drive the filter backwards.
+			last_temporal_frame = temporal_frame_key;
+			return;
+		}
+
+		const float dt_seconds = std::clamp(
+		        float(temporal_frame_key - last_temporal_frame) * 1e-9f,
+		        0.001f,
+		        0.025f);
+		last_temporal_frame = temporal_frame_key;
+
+		const float angle = angular_distance(*temporal_output, *fixation);
+		float tau_seconds;
+
+		if (temporal_fast_frames_remaining > 0)
+		{
+			tau_seconds = temporal_fast_tau_seconds;
+			--temporal_fast_frames_remaining;
+			++temporal_fast_updates;
+		}
+		else if (angle < temporal_slow_angle_rad)
+		{
+			tau_seconds = temporal_slow_tau_seconds;
+			++temporal_slow_updates;
+		}
+		else if (angle < saccade_rad)
+		{
+			tau_seconds = temporal_medium_tau_seconds;
+			++temporal_medium_updates;
+		}
+		else
+		{
+			tau_seconds = temporal_fast_tau_seconds;
+			++temporal_fast_updates;
+		}
+
+		const float alpha = 1.0f - std::exp(-dt_seconds / tau_seconds);
+		temporal_output = normalized_blend(*temporal_output, *fixation, alpha);
+		++temporal_updates;
+	}
+
 public:
 	void apply(
 	        from_headset::tracking::pose & pose,
 	        XrTime timestamp,
-	        XrTime frame_key,
+	        XrTime source_frame_key,
+	        XrTime temporal_frame_key,
 	        bool canonical_sample)
 	{
 		++requests;
@@ -598,18 +680,19 @@ public:
 		if (not fixation)
 		{
 			start_fixation(raw);
-			last_update_frame = frame_key;
-			++frame_updates;
+			last_source_update_frame = source_frame_key;
+			++source_updates;
 		}
-		else if (canonical_sample and frame_key != last_update_frame)
+		else if (canonical_sample and source_frame_key != last_source_update_frame)
 		{
-			last_update_frame = frame_key;
-			++frame_updates;
+			last_source_update_frame = source_frame_key;
+			++source_updates;
 
 			const float angle = angular_distance(*fixation, raw);
 			if (angle >= saccade_rad)
 			{
 				start_fixation(raw);
+				temporal_fast_frames_remaining = temporal_fast_frames_after_saccade;
 				++saccade_bypasses;
 			}
 			else if (angle > fixation_radius_rad)
@@ -635,11 +718,14 @@ public:
 			++held_requests;
 		}
 
+		advance_temporal(temporal_frame_key);
+
+		const glm::quat & output = temporal_output ? *temporal_output : *fixation;
 		pose.pose.orientation = {
-		        .x = fixation->x,
-		        .y = fixation->y,
-		        .z = fixation->z,
-		        .w = fixation->w,
+		        .x = output.x,
+		        .y = output.y,
+		        .z = output.z,
+		        .w = output.w,
 		};
 
 		pose.angular_velocity = {};
@@ -652,14 +738,18 @@ public:
 		else if (timestamp >= next_log)
 		{
 			spdlog::info(
-			        "Steam Frame gaze v5: requests={}, updates={}, held={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}",
+			        "Steam Frame gaze v6: requests={}, source_updates={}, request_holds={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}, temporal_updates={} (slow={}, medium={}, fast={})",
 			        requests,
-			        frame_updates,
+			        source_updates,
 			        held_requests,
 			        fixation_samples_accepted,
 			        stray_samples_rejected,
 			        fixation_switches,
-			        saccade_bypasses);
+			        saccade_bypasses,
+			        temporal_updates,
+			        temporal_slow_updates,
+			        temporal_medium_updates,
+			        temporal_fast_updates);
 			next_log = timestamp + 5'000'000'000;
 		}
 	}
@@ -944,7 +1034,7 @@ void scenes::stream::tracking()
 	if (frame_gaze_fix_enabled())
 	{
 		spdlog::info(
-		        "Steam Frame gaze v5 active: binocular mmap source, 2.75 deg fixation lock, 5.00 deg saccade");
+		        "Steam Frame gaze v6 active: binocular mmap + 144 Hz adaptive temporal (50/25/8 ms), 2.75 deg fixation lock, 5.00 deg saccade");
 	}
 
 	while (state_ != state::shutdown)
@@ -1147,6 +1237,7 @@ void scenes::stream::tracking()
 									        tracking.device_poses.back(),
 									        tracking.timestamp,
 									        XrTime(mmap_sample->sequence),
+									        pattern_begin,
 									        true);
 									used_frame_mmap = true;
 								}
@@ -1217,6 +1308,7 @@ void scenes::stream::tracking()
 									gaze_stabilizer.apply(
 									        tracking.device_poses.back(),
 									        tracking.timestamp,
+									        pattern_begin,
 									        pattern_begin,
 									        canonical_sample);
 								}
