@@ -54,25 +54,104 @@ bool frame_gaze_fix_enabled()
 
 class frame_gaze_stabilizer
 {
-	std::optional<glm::quat> filtered;
-	XrTime last_timestamp = 0;
-	uint64_t samples = 0;
+	std::optional<glm::quat> fixation;
+	std::optional<glm::quat> first_outside;
+	XrTime last_update_frame = 0;
+	uint64_t fixation_samples = 0;
+
+	uint64_t requests = 0;
+	uint64_t frame_updates = 0;
+	uint64_t held_requests = 0;
+	uint64_t fixation_samples_accepted = 0;
+	uint64_t stray_samples_rejected = 0;
+	uint64_t fixation_switches = 0;
 	uint64_t saccade_bypasses = 0;
-	uint64_t micro_jitter_samples = 0;
 	XrTime next_log = 0;
 
-	static constexpr float micro_jitter_rad = 0.30f * M_PI / 180.0f;
+	static constexpr float fixation_radius_rad = 1.0f * M_PI / 180.0f;
 	static constexpr float saccade_rad = 2.5f * M_PI / 180.0f;
-	static constexpr double tau_seconds = 0.010;
+	static constexpr uint64_t max_fixation_samples = 144;
+
+	static glm::quat align_hemisphere(const glm::quat & reference, glm::quat value)
+	{
+		if (glm::dot(reference, value) < 0.0f)
+		{
+			value = glm::quat(-value.w, -value.x, -value.y, -value.z);
+		}
+		return value;
+	}
+
+	static float angular_distance(const glm::quat & a, const glm::quat & b)
+	{
+		glm::quat aligned = align_hemisphere(a, b);
+		float d = std::clamp(glm::dot(a, aligned), 0.0f, 1.0f);
+		return 2.0f * std::acos(d);
+	}
+
+	static glm::quat normalized_blend(const glm::quat & a, glm::quat b, float alpha)
+	{
+		b = align_hemisphere(a, b);
+		return glm::normalize(glm::quat(
+		        a.w + alpha * (b.w - a.w),
+		        a.x + alpha * (b.x - a.x),
+		        a.y + alpha * (b.y - a.y),
+		        a.z + alpha * (b.z - a.z)));
+	}
+
+	void start_fixation(glm::quat raw)
+	{
+		fixation = glm::normalize(raw);
+		first_outside.reset();
+		fixation_samples = 1;
+	}
+
+	void accept_fixation_sample(glm::quat raw)
+	{
+		float alpha;
+		if (fixation_samples < max_fixation_samples)
+		{
+			alpha = 1.0f / float(fixation_samples + 1);
+			++fixation_samples;
+		}
+		else
+		{
+			alpha = 1.0f / float(max_fixation_samples);
+		}
+
+		fixation = normalized_blend(*fixation, raw, alpha);
+		++fixation_samples_accepted;
+	}
+
+	void switch_to_outside_fixation(glm::quat raw)
+	{
+		glm::quat first = *first_outside;
+		raw = align_hemisphere(first, raw);
+		fixation = glm::normalize(glm::quat(
+		        first.w + raw.w,
+		        first.x + raw.x,
+		        first.y + raw.y,
+		        first.z + raw.z));
+		first_outside.reset();
+		fixation_samples = 2;
+		++fixation_switches;
+	}
 
 public:
-	void apply(from_headset::tracking::pose & pose, XrTime timestamp)
+	void apply(
+	        from_headset::tracking::pose & pose,
+	        XrTime timestamp,
+	        XrTime frame_key,
+	        bool canonical_sample)
 	{
+		++requests;
+
 		using flags = from_headset::pose_flags;
 		const uint8_t orientation_ok =
 		        uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked);
 		if ((pose.flags & orientation_ok) != orientation_ok)
+		{
 			return;
+		}
 
 		glm::quat raw(
 		        pose.pose.orientation.w,
@@ -81,74 +160,72 @@ public:
 		        pose.pose.orientation.z);
 		raw = glm::normalize(raw);
 
-		if (not filtered)
+		if (not fixation)
 		{
-			filtered = raw;
-			last_timestamp = timestamp;
+			start_fixation(raw);
+			last_update_frame = frame_key;
+			++frame_updates;
 		}
-		else
+		else if (canonical_sample and frame_key != last_update_frame)
 		{
-			float d = glm::dot(*filtered, raw);
-			if (d < 0.0f)
-			{
-				raw = glm::quat(-raw.w, -raw.x, -raw.y, -raw.z);
-				d = -d;
-			}
-			d = std::clamp(d, 0.0f, 1.0f);
-			const float angle = 2.0f * std::acos(d);
+			last_update_frame = frame_key;
+			++frame_updates;
 
-			double dt = last_timestamp > 0
-			                    ? double(timestamp - last_timestamp) / 1'000'000'000.0
-			                    : tau_seconds;
-			dt = std::clamp(dt, 0.0005, 0.050);
-
-			float alpha;
+			const float angle = angular_distance(*fixation, raw);
 			if (angle >= saccade_rad)
 			{
-				alpha = 1.0f;
+				start_fixation(raw);
 				++saccade_bypasses;
+			}
+			else if (angle > fixation_radius_rad)
+			{
+				if (first_outside)
+				{
+					switch_to_outside_fixation(raw);
+				}
+				else
+				{
+					first_outside = raw;
+					++stray_samples_rejected;
+				}
 			}
 			else
 			{
-				alpha = float(1.0 - std::exp(-dt / tau_seconds));
-				if (angle < micro_jitter_rad)
-				{
-					alpha *= 0.25f;
-					++micro_jitter_samples;
-				}
-				alpha = std::clamp(alpha, 0.03f, 1.0f);
+				first_outside.reset();
+				accept_fixation_sample(raw);
 			}
-
-			glm::quat blended(
-			        filtered->w + alpha * (raw.w - filtered->w),
-			        filtered->x + alpha * (raw.x - filtered->x),
-			        filtered->y + alpha * (raw.y - filtered->y),
-			        filtered->z + alpha * (raw.z - filtered->z));
-			filtered = glm::normalize(blended);
-			last_timestamp = timestamp;
+		}
+		else
+		{
+			++held_requests;
 		}
 
 		pose.pose.orientation = {
-		        .x = filtered->x,
-		        .y = filtered->y,
-		        .z = filtered->z,
-		        .w = filtered->w,
+		        .x = fixation->x,
+		        .y = fixation->y,
+		        .z = fixation->z,
+		        .w = fixation->w,
 		};
 
 		pose.angular_velocity = {};
 		pose.flags &= ~uint8_t(flags::angular_velocity_valid);
-		++samples;
 
 		if (next_log == 0)
-			next_log = timestamp + 5'000'000'000;
-		else if (timestamp >= next_log)
+		{
+			next_log = frame_key + 5'000'000'000;
+		}
+		else if (frame_key >= next_log)
 		{
 			spdlog::info(
-			        "Steam Frame gaze v2: samples={}, saccade_bypass={}, micro_jitter={}",
-			        samples,
-			        saccade_bypasses,
-			        micro_jitter_samples);
-			next_log = timestamp + 5'000'000'000;
+			        "Steam Frame gaze v3: requests={}, frame_updates={}, held={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}",
+			        requests,
+			        frame_updates,
+			        held_requests,
+			        fixation_samples_accepted,
+			        stray_samples_rejected,
+			        fixation_switches,
+			        saccade_bypasses);
+			next_log = frame_key + 5'000'000'000;
 		}
 	}
 };
@@ -426,9 +503,12 @@ void scenes::stream::tracking()
 	XrDuration frame_duration{};
 	XrTime pattern_begin = instance.now();
 	frame_gaze_stabilizer gaze_stabilizer;
+	std::optional<XrDuration> gaze_canonical_prediction_ns;
 
 	if (frame_gaze_fix_enabled())
-		spdlog::info("Steam Frame gaze v2 active: stable reference + adaptive 10 ms filter (micro=0.30 deg, saccade=2.50 deg)");
+	{
+		spdlog::info("Steam Frame gaze v3 active: 1.00 deg fixation lock + one canonical gaze sample per display frame (saccade=2.50 deg)");
+	}
 
 	while (state_ != state::shutdown)
 	{
@@ -505,6 +585,21 @@ void scenes::stream::tracking()
 						}
 						else
 							body_tracker.emplace<std::monostate>();
+					}
+
+					gaze_canonical_prediction_ns.reset();
+					for (const auto & item: pattern)
+					{
+						if (item.device != device_id::EYE_GAZE)
+						{
+							continue;
+						}
+
+						if (not gaze_canonical_prediction_ns or
+						    std::abs(item.prediction_ns) < std::abs(*gaze_canonical_prediction_ns))
+						{
+							gaze_canonical_prediction_ns = item.prediction_ns;
+						}
 					}
 
 					std::ranges::sort(pattern, std::less{}, [frame_duration](const auto & i) { return -i.prediction_ns % frame_duration; });
@@ -617,7 +712,16 @@ void scenes::stream::tracking()
 							if (frame_gaze_fix_enabled() and
 							    not tracking.device_poses.empty() and
 							    tracking.device_poses.back().device == wivrn::device_id::EYE_GAZE)
-								gaze_stabilizer.apply(tracking.device_poses.back(), tracking.timestamp);
+							{
+								const bool canonical_sample =
+								        gaze_canonical_prediction_ns and
+								        item.prediction_ns == *gaze_canonical_prediction_ns;
+								gaze_stabilizer.apply(
+								        tracking.device_poses.back(),
+								        tracking.timestamp,
+								        pattern_begin,
+								        canonical_sample);
+							}
 							break;
 						case wivrn::device_id::FACE:
 							std::visit(utils::overloaded{
