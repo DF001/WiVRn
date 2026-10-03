@@ -25,12 +25,12 @@
 #include "xr/face_tracker.h"
 #include "xr/fb_body_tracker.h"
 #include "xr/to_string.h"
-#include <magic_enum.hpp>
-#include <magic_enum_containers.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <magic_enum.hpp>
+#include <magic_enum_containers.hpp>
 #include <ranges>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -63,15 +63,13 @@ bool frame_gaze_fix_enabled()
 	return enabled;
 }
 
-
 #if defined(__linux__) && !defined(__ANDROID__)
 class steam_frame_eye_mmap
 {
 public:
 	enum class source
 	{
-		left,
-		right_fallback,
+		combined,
 		held,
 	};
 
@@ -81,7 +79,7 @@ public:
 		glm::vec3 direction{0.0f, 0.0f, -1.0f};
 		float left_uncertainty = 0.0f;
 		float right_uncertainty = 0.0f;
-		source selected = source::left;
+		source selected = source::combined;
 	};
 
 private:
@@ -102,6 +100,7 @@ private:
 
 	static constexpr float eye_lost_threshold = 0.004f;
 	static constexpr float eye_found_threshold = 0.0025f;
+	static constexpr uint32_t recovery_samples_required = 3;
 
 	int fd = -1;
 	uint8_t * data = nullptr;
@@ -110,9 +109,14 @@ private:
 
 	bool left_good = false;
 	bool right_good = false;
+	bool source_ready = false;
+	bool have_seen_sequence = false;
+	uint32_t recovery_samples = 0;
+	uint32_t last_seen_sequence = 0;
 	std::optional<glm::vec3> last_good_direction;
 	uint32_t last_good_sequence = 0;
-	std::optional<source> last_source;
+	source current_source = source::held;
+	std::optional<source> last_logged_source;
 
 	template <typename T>
 	T load(size_t offset) const
@@ -215,29 +219,23 @@ private:
 
 	void log_source(source selected, float left_unc, float right_unc)
 	{
-		if (last_source and *last_source == selected)
+		if (last_logged_source and *last_logged_source == selected)
 		{
 			return;
 		}
-		last_source = selected;
+		last_logged_source = selected;
 
 		switch (selected)
 		{
-			case source::left:
+			case source::combined:
 				spdlog::info(
-				        "Steam Frame gaze v4 source: LEFT POST (left_unc={:.6f}, right_unc={:.6f})",
-				        left_unc,
-				        right_unc);
-				break;
-			case source::right_fallback:
-				spdlog::warn(
-				        "Steam Frame gaze v4 source: RIGHT fallback (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v5 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::held:
 				spdlog::warn(
-				        "Steam Frame gaze v4 source: HOLD last stable gaze (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v5 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
@@ -249,14 +247,14 @@ private:
 		fd = ::open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 		{
-			spdlog::warn("Steam Frame gaze v4: cannot open {}: {}", path, std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v5: cannot open {}: {}", path, std::strerror(errno));
 			return false;
 		}
 
 		struct stat st{};
 		if (fstat(fd, &st) != 0)
 		{
-			spdlog::warn("Steam Frame gaze v4: fstat failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v5: fstat failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -266,7 +264,7 @@ private:
 		if (size < expected_size)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v4: eye mmap too small ({} bytes, need at least {})",
+			        "Steam Frame gaze v5: eye mmap too small ({} bytes, need at least {})",
 			        size,
 			        expected_size);
 			::close(fd);
@@ -277,7 +275,7 @@ private:
 		void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (mapped == MAP_FAILED)
 		{
-			spdlog::warn("Steam Frame gaze v4: mmap failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v5: mmap failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -291,7 +289,7 @@ private:
 		if (version != supported_version or initialized != 1)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v4: unsupported eye mmap (version={}, initialized={})",
+			        "Steam Frame gaze v5: unsupported eye mmap (version={}, initialized={})",
 			        version,
 			        initialized);
 			munmap(data, size);
@@ -303,7 +301,7 @@ private:
 		}
 
 		spdlog::info(
-		        "Steam Frame gaze v4 mmap active: ABI v5 LEFT POST preferred, RIGHT covariance fallback, hold on dual-eye loss");
+		        "Steam Frame gaze v5 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
 		return true;
 	}
 
@@ -362,46 +360,74 @@ public:
 		const float left_unc = uncertainty(covariance, true);
 		const float right_unc = uncertainty(covariance, false);
 
-		left_good = left.has_value() and update_eye_good(left_good, left_unc);
-		right_good = right.has_value() and update_eye_good(right_good, right_unc);
-
-		if (left_good)
+		const bool new_sequence = not have_seen_sequence or sequence != last_seen_sequence;
+		if (new_sequence)
 		{
-			last_good_direction = *left;
-			last_good_sequence = sequence;
-			log_source(source::left, left_unc, right_unc);
-			return sample{
-			        .sequence = sequence,
-			        .direction = *left,
-			        .left_uncertainty = left_unc,
-			        .right_uncertainty = right_unc,
-			        .selected = source::left,
-			};
-		}
+			have_seen_sequence = true;
+			last_seen_sequence = sequence;
 
-		if (right_good)
-		{
-			last_good_direction = *right;
-			last_good_sequence = sequence;
-			log_source(source::right_fallback, left_unc, right_unc);
-			return sample{
-			        .sequence = sequence,
-			        .direction = *right,
-			        .left_uncertainty = left_unc,
-			        .right_uncertainty = right_unc,
-			        .selected = source::right_fallback,
-			};
+			left_good = left.has_value() and update_eye_good(left_good, left_unc);
+			right_good = right.has_value() and update_eye_good(right_good, right_unc);
+
+			std::optional<glm::vec3> combined;
+			if (left_good and right_good and left and right)
+			{
+				const glm::vec3 sum = *left + *right;
+				const float length = glm::length(sum);
+				if (std::isfinite(length) and length >= 1e-6f)
+				{
+					combined = sum / length;
+				}
+			}
+
+			if (combined)
+			{
+				if (not last_good_direction)
+				{
+					// At startup there is nothing useful to hold, so accept the first
+					// healthy binocular sample immediately.
+					source_ready = true;
+					recovery_samples = recovery_samples_required;
+				}
+				else if (not source_ready)
+				{
+					++recovery_samples;
+					if (recovery_samples >= recovery_samples_required)
+					{
+						source_ready = true;
+					}
+				}
+
+				if (source_ready)
+				{
+					last_good_direction = *combined;
+					last_good_sequence = sequence;
+					current_source = source::combined;
+					log_source(current_source, left_unc, right_unc);
+				}
+				else
+				{
+					current_source = source::held;
+					log_source(current_source, left_unc, right_unc);
+				}
+			}
+			else
+			{
+				source_ready = false;
+				recovery_samples = 0;
+				current_source = source::held;
+				log_source(current_source, left_unc, right_unc);
+			}
 		}
 
 		if (last_good_direction)
 		{
-			log_source(source::held, left_unc, right_unc);
 			return sample{
 			        .sequence = last_good_sequence,
 			        .direction = *last_good_direction,
 			        .left_uncertainty = left_unc,
 			        .right_uncertainty = right_unc,
-			        .selected = source::held,
+			        .selected = current_source,
 			};
 		}
 
@@ -626,7 +652,7 @@ public:
 		else if (timestamp >= next_log)
 		{
 			spdlog::info(
-			        "Steam Frame gaze v4: requests={}, updates={}, held={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}",
+			        "Steam Frame gaze v5: requests={}, updates={}, held={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}",
 			        requests,
 			        frame_updates,
 			        held_requests,
@@ -918,7 +944,7 @@ void scenes::stream::tracking()
 	if (frame_gaze_fix_enabled())
 	{
 		spdlog::info(
-		        "Steam Frame gaze v4 active: mmap ABI-v5 preferred, 2.75 deg fixation lock, 5.00 deg saccade");
+		        "Steam Frame gaze v5 active: binocular mmap source, 2.75 deg fixation lock, 5.00 deg saccade");
 	}
 
 	while (state_ != state::shutdown)
@@ -1092,8 +1118,7 @@ void scenes::stream::tracking()
 						case wivrn::device_id::RIGHT_POKE:
 							locate_spaces.add_space(item.device, spaces[item.device], tracking.timestamp, tracking.device_poses);
 							break;
-						case wivrn::device_id::EYE_GAZE:
-						{
+						case wivrn::device_id::EYE_GAZE: {
 							bool used_frame_mmap = false;
 
 							if (frame_gaze_fix_enabled() and frame_eye_mmap.active())
@@ -1115,9 +1140,7 @@ void scenes::stream::tracking()
 									                        },
 									                },
 									                .device = item.device,
-									                .flags =
-									                        uint8_t(flags::orientation_valid) |
-									                        uint8_t(flags::orientation_tracked),
+									                .flags = uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked),
 									        });
 
 									gaze_stabilizer.apply(
@@ -1179,11 +1202,7 @@ void scenes::stream::tracking()
 									                        },
 									                },
 									                .device = item.device,
-									                .flags = uint8_t(
-									                        gaze.flags &
-									                        view_pose.flags &
-									                        ~(flags::linear_velocity_valid |
-									                          flags::angular_velocity_valid)),
+									                .flags = uint8_t(gaze.flags & view_pose.flags & ~(flags::linear_velocity_valid | flags::angular_velocity_valid)),
 									        });
 								}
 
