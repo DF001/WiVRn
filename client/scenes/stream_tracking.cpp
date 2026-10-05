@@ -43,6 +43,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -76,6 +77,7 @@ public:
 	struct sample
 	{
 		uint32_t sequence = 0;
+		double sample_time_raw = 0.0;
 		glm::vec3 direction{0.0f, 0.0f, -1.0f};
 		float left_uncertainty = 0.0f;
 		float right_uncertainty = 0.0f;
@@ -114,6 +116,7 @@ private:
 	uint32_t recovery_samples = 0;
 	uint32_t last_seen_sequence = 0;
 	std::optional<glm::vec3> last_good_direction;
+	double last_good_sample_time_raw = 0.0;
 	uint32_t last_good_sequence = 0;
 	source current_source = source::held;
 	std::optional<source> last_logged_source;
@@ -229,13 +232,13 @@ private:
 		{
 			case source::combined:
 				spdlog::info(
-				        "Steam Frame gaze v6 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v7 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::held:
 				spdlog::warn(
-				        "Steam Frame gaze v6 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v7 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
@@ -247,14 +250,14 @@ private:
 		fd = ::open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 		{
-			spdlog::warn("Steam Frame gaze v6: cannot open {}: {}", path, std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v7: cannot open {}: {}", path, std::strerror(errno));
 			return false;
 		}
 
 		struct stat st{};
 		if (fstat(fd, &st) != 0)
 		{
-			spdlog::warn("Steam Frame gaze v6: fstat failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v7: fstat failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -264,7 +267,7 @@ private:
 		if (size < expected_size)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v6: eye mmap too small ({} bytes, need at least {})",
+			        "Steam Frame gaze v7: eye mmap too small ({} bytes, need at least {})",
 			        size,
 			        expected_size);
 			::close(fd);
@@ -275,7 +278,7 @@ private:
 		void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (mapped == MAP_FAILED)
 		{
-			spdlog::warn("Steam Frame gaze v6: mmap failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v7: mmap failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -289,7 +292,7 @@ private:
 		if (version != supported_version or initialized != 1)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v6: unsupported eye mmap (version={}, initialized={})",
+			        "Steam Frame gaze v7: unsupported eye mmap (version={}, initialized={})",
 			        version,
 			        initialized);
 			munmap(data, size);
@@ -301,7 +304,7 @@ private:
 		}
 
 		spdlog::info(
-		        "Steam Frame gaze v6 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
+		        "Steam Frame gaze v7 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
 		return true;
 	}
 
@@ -401,6 +404,7 @@ public:
 				if (source_ready)
 				{
 					last_good_direction = *combined;
+					last_good_sample_time_raw = timestamp;
 					last_good_sequence = sequence;
 					current_source = source::combined;
 					log_source(current_source, left_unc, right_unc);
@@ -424,6 +428,7 @@ public:
 		{
 			return sample{
 			        .sequence = last_good_sequence,
+			        .sample_time_raw = last_good_sample_time_raw,
 			        .direction = *last_good_direction,
 			        .left_uncertainty = left_unc,
 			        .right_uncertainty = right_unc,
@@ -463,6 +468,7 @@ public:
 	struct sample
 	{
 		uint32_t sequence = 0;
+		double sample_time_raw = 0.0;
 		glm::vec3 direction{0.0f, 0.0f, -1.0f};
 	};
 
@@ -738,7 +744,7 @@ public:
 		else if (timestamp >= next_log)
 		{
 			spdlog::info(
-			        "Steam Frame gaze v6: requests={}, source_updates={}, request_holds={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}, temporal_updates={} (slow={}, medium={}, fast={})",
+			        "Steam Frame gaze v7: requests={}, source_updates={}, request_holds={}, accepted={}, stray_rejected={}, fixation_switches={}, saccade_bypass={}, temporal_updates={} (slow={}, medium={}, fast={})",
 			        requests,
 			        source_updates,
 			        held_requests,
@@ -754,6 +760,32 @@ public:
 		}
 	}
 };
+
+std::optional<glm::quat> tracked_orientation(const from_headset::tracking::pose & pose)
+{
+	using flags = from_headset::pose_flags;
+	const uint8_t orientation_ok =
+	        uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked);
+
+	if ((pose.flags & orientation_ok) != orientation_ok)
+	{
+		return std::nullopt;
+	}
+
+	glm::quat orientation(
+	        pose.pose.orientation.w,
+	        pose.pose.orientation.x,
+	        pose.pose.orientation.y,
+	        pose.pose.orientation.z);
+
+	const float length = glm::length(orientation);
+	if (not std::isfinite(length) or length < 1e-6f)
+	{
+		return std::nullopt;
+	}
+
+	return orientation / length;
+}
 
 from_headset::tracking::pose locate_space(device_id device, XrSpace space, XrSpace reference, XrTime time)
 {
@@ -1031,10 +1063,20 @@ void scenes::stream::tracking()
 	steam_frame_eye_mmap frame_eye_mmap(frame_gaze_fix_enabled());
 	std::optional<XrDuration> gaze_canonical_prediction_ns;
 
+	std::optional<glm::quat> frame_world_gaze;
+	uint32_t frame_world_gaze_sequence = 0;
+	bool frame_world_gaze_have_sequence = false;
+	uint64_t frame_world_compensated_samples = 0;
+	uint64_t frame_world_reprojections = 0;
+	uint64_t frame_world_compensation_failures = 0;
+	double frame_world_sample_age_sum_ms = 0.0;
+	double frame_world_sample_age_max_ms = 0.0;
+	XrTime frame_world_next_log = 0;
+
 	if (frame_gaze_fix_enabled())
 	{
 		spdlog::info(
-		        "Steam Frame gaze v6 active: binocular mmap + 144 Hz adaptive temporal (50/25/8 ms), 2.75 deg fixation lock, 5.00 deg saccade");
+		        "Steam Frame gaze v7 active: timestamp-corrected world-space binocular mmap + 144 Hz adaptive temporal (50/25/8 ms), 2.75 deg fixation lock, 5.00 deg saccade");
 	}
 
 	while (state_ != state::shutdown)
@@ -1215,31 +1257,142 @@ void scenes::stream::tracking()
 							{
 								if (auto mmap_sample = frame_eye_mmap.read())
 								{
-									const glm::quat gaze_quat =
-									        steam_frame_eye_mmap::direction_to_quaternion(mmap_sample->direction);
-									using flags = from_headset::pose_flags;
-
-									tracking.device_poses.push_back(
-									        from_headset::tracking::pose{
-									                .pose = {
-									                        .orientation = {
-									                                .x = gaze_quat.x,
-									                                .y = gaze_quat.y,
-									                                .z = gaze_quat.z,
-									                                .w = gaze_quat.w,
-									                        },
-									                },
-									                .device = item.device,
-									                .flags = uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked),
-									        });
-
-									gaze_stabilizer.apply(
-									        tracking.device_poses.back(),
-									        tracking.timestamp,
-									        XrTime(mmap_sample->sequence),
-									        pattern_begin,
-									        true);
+									// The private mmap ray is head-relative at its own sample time.
+									// Convert each new accepted source sample into world space using the
+									// head pose at that eye timestamp. The stabilizer then operates in
+									// world space, so natural eye counter-rotation from head motion is
+									// not mistaken for gaze drift. Every requested output is converted
+									// back to head-relative using the head pose at tracking.timestamp.
 									used_frame_mmap = true;
+
+									const auto current_head_pose = locate_space(
+									        device_id::HEAD,
+									        view_space,
+									        height_offset_space,
+									        tracking.timestamp);
+									const auto current_head = tracked_orientation(current_head_pose);
+
+									const bool new_world_source =
+									        not frame_world_gaze_have_sequence or
+									        mmap_sample->sequence != frame_world_gaze_sequence;
+
+									if (new_world_source)
+									{
+										timespec raw_now_ts{};
+										if (clock_gettime(CLOCK_MONOTONIC_RAW, &raw_now_ts) == 0)
+										{
+											const double raw_now =
+											        double(raw_now_ts.tv_sec) + double(raw_now_ts.tv_nsec) * 1e-9;
+											const double age_seconds = raw_now - mmap_sample->sample_time_raw;
+
+											// A fresh accepted sample measured ~17 ms old on the Frame.
+											// Reject impossible clock values rather than mixing coordinate spaces.
+											if (std::isfinite(age_seconds) and age_seconds >= 0.0 and age_seconds <= 0.250)
+											{
+												const XrTime xr_now = instance.now();
+												const XrDuration age_ns = XrDuration(std::llround(age_seconds * 1e9));
+												const XrTime eye_sample_time = xr_now - age_ns;
+												const auto sample_head_pose = locate_space(
+												        device_id::HEAD,
+												        view_space,
+												        height_offset_space,
+												        eye_sample_time);
+												const auto sample_head = tracked_orientation(sample_head_pose);
+
+												if (sample_head)
+												{
+													const glm::quat head_relative_gaze =
+													        steam_frame_eye_mmap::direction_to_quaternion(mmap_sample->direction);
+													frame_world_gaze = glm::normalize(*sample_head * head_relative_gaze);
+													frame_world_gaze_sequence = mmap_sample->sequence;
+													frame_world_gaze_have_sequence = true;
+
+													const double age_ms = age_seconds * 1000.0;
+													frame_world_sample_age_sum_ms += age_ms;
+													frame_world_sample_age_max_ms =
+													        std::max(frame_world_sample_age_max_ms, age_ms);
+													++frame_world_compensated_samples;
+												}
+												else
+												{
+													++frame_world_compensation_failures;
+												}
+											}
+											else
+											{
+												++frame_world_compensation_failures;
+											}
+										}
+										else
+										{
+											++frame_world_compensation_failures;
+										}
+									}
+
+									if (frame_world_gaze and current_head)
+									{
+										using flags = from_headset::pose_flags;
+										from_headset::tracking::pose gaze_pose{
+										        .pose = {
+										                .orientation = {
+										                        .x = frame_world_gaze->x,
+										                        .y = frame_world_gaze->y,
+										                        .z = frame_world_gaze->z,
+										                        .w = frame_world_gaze->w,
+										                },
+										        },
+										        .device = item.device,
+										        .flags = uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked),
+										};
+
+										gaze_stabilizer.apply(
+										        gaze_pose,
+										        tracking.timestamp,
+										        XrTime(frame_world_gaze_sequence),
+										        pattern_begin,
+										        true);
+
+										const glm::quat stabilized_world(
+										        gaze_pose.pose.orientation.w,
+										        gaze_pose.pose.orientation.x,
+										        gaze_pose.pose.orientation.y,
+										        gaze_pose.pose.orientation.z);
+										const glm::quat head_relative_output =
+										        glm::normalize(glm::conjugate(*current_head) * stabilized_world);
+
+										gaze_pose.pose.orientation = {
+										        .x = head_relative_output.x,
+										        .y = head_relative_output.y,
+										        .z = head_relative_output.z,
+										        .w = head_relative_output.w,
+										};
+										tracking.device_poses.push_back(gaze_pose);
+										++frame_world_reprojections;
+									}
+									else if (not current_head)
+									{
+										++frame_world_compensation_failures;
+									}
+
+									if (frame_world_next_log == 0)
+									{
+										frame_world_next_log = tracking.timestamp + 5'000'000'000;
+									}
+									else if (tracking.timestamp >= frame_world_next_log)
+									{
+										const double average_age_ms =
+										        frame_world_compensated_samples > 0
+										                ? frame_world_sample_age_sum_ms / double(frame_world_compensated_samples)
+										                : 0.0;
+										spdlog::info(
+										        "Steam Frame gaze v7 world: compensated_samples={}, reprojections={}, failures={}, sample_age_avg={:.2f} ms, sample_age_max={:.2f} ms",
+										        frame_world_compensated_samples,
+										        frame_world_reprojections,
+										        frame_world_compensation_failures,
+										        average_age_ms,
+										        frame_world_sample_age_max_ms);
+										frame_world_next_log = tracking.timestamp + 5'000'000'000;
+									}
 								}
 							}
 
