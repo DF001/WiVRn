@@ -40,6 +40,9 @@
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -52,6 +55,32 @@
 
 using namespace wivrn;
 using namespace beman::inplace_vector;
+
+namespace
+{
+bool steam_frame_v3_enabled()
+{
+#if WIVRN_USE_V4L2
+	static const bool enabled = [] {
+		if (const char * value = std::getenv("WIVRN_FRAME_V3"))
+			return std::strcmp(value, "0") != 0;
+		return bool(WIVRN_STEAM_FRAME_EXPERIMENTS);
+	}();
+	return enabled;
+#else
+	return false;
+#endif
+}
+
+bool steam_frame_v3_144hz(XrDuration period)
+{
+	if (not steam_frame_v3_enabled() or period <= 0)
+		return false;
+
+	constexpr double target = 1'000'000'000.0 / 144.0;
+	return std::abs(double(period) - target) <= target * 0.05;
+}
+} // namespace
 
 // clang-format off
 static const std::unordered_map<std::string, device_id> device_ids = {
@@ -665,6 +694,7 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 {
 	if (decoders.empty())
 		return {};
+	const bool frame_v3 = steam_frame_v3_144hz(display_time_period.load());
 	std::unique_lock lock(frames_mutex);
 	inplace_vector<shard_accumulator::blit_handle *, decoder_count> common_frames;
 	const bool alpha = decoders[0].latest_frames[0] and decoders[0].latest_frames[0]->view_info.alpha;
@@ -695,16 +725,46 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 	std::array<std::shared_ptr<shard_accumulator::blit_handle>, decoder_count> result;
 	if (not common_frames.empty())
 	{
-		auto min = std::ranges::min_element(common_frames,
-		                                    std::ranges::less{},
-		                                    [display_time](auto frame) {
-			                                    if (not frame)
-				                                    return std::numeric_limits<XrTime>::max();
-			                                    return std::abs(frame->view_info.display_time - display_time);
-		                                    });
+		shard_accumulator::blit_handle * selected = nullptr;
+		if (frame_v3)
+		{
+			// Latest-frame-wins, but do not jump more than one 144 Hz display
+			// interval into the future. This keeps latency low without choosing a
+			// frame whose server-side pose/display target is implausibly early.
+			const XrDuration period = display_time_period.load();
+			for (auto * frame: common_frames)
+			{
+				if (not frame)
+					continue;
+				if (frame->view_info.display_time > display_time + period)
+					continue;
+				if (not selected or frame->feedback.frame_index > selected->feedback.frame_index)
+					selected = frame;
+			}
+		}
 
-		assert(*min);
-		auto frame_index = (*min)->feedback.frame_index;
+		if (not selected)
+		{
+			auto min = std::ranges::min_element(common_frames,
+			                                    std::ranges::less{},
+			                                    [display_time](auto frame) {
+				                                    if (not frame)
+					                                    return std::numeric_limits<XrTime>::max();
+				                                    return std::abs(frame->view_info.display_time - display_time);
+			                                    });
+			assert(*min);
+			selected = *min;
+		}
+
+		auto frame_index = selected->feedback.frame_index;
+		if (frame_v3 and frame_v3_last_common_frame and frame_index < *frame_v3_last_common_frame)
+		{
+			++frame_v3_regressions_rejected;
+			return {};
+		}
+		if (frame_v3)
+			frame_v3_last_common_frame = frame_index;
+
 		for (auto [i, decoder]: utils::enumerate(decoders))
 		{
 			if (alpha or i < view_count)
@@ -713,6 +773,18 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 	}
 	else
 	{
+		// On Steam Frame, never present different temporal frames to the two
+		// eyes during normal gameplay. Returning no stream layer lets the
+		// runtime keep/reproject the previously submitted coherent layer.
+		if (frame_v3 and not is_gui_interactable())
+		{
+			++frame_v3_common_misses;
+			return {};
+		}
+
+		if (frame_v3)
+			++frame_v3_gui_stereo_fallbacks;
+
 		spdlog::warn("Failed to find a common frame for all decoders, dumping available frames per decoder");
 		for (const auto & decoder: decoders)
 		{
@@ -912,6 +984,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Search for frame with desired display time on all decoders
 	// If no such frame exists, use the latest frame for each decoder
 	current_blit_handles = common_frame(frame_state.predictedDisplayTime);
+
+	if (steam_frame_v3_144hz(frame_state.predictedDisplayPeriod))
+	{
+		const bool fresh = std::ranges::any_of(
+		        current_blit_handles,
+		        [](const auto & h) { return h and h->feedback.times_displayed == 0; });
+		if (fresh)
+			++frame_v3_fresh_frames;
+		else
+			++frame_v3_reprojection_ticks;
+
+		if (frame_v3_next_log == 0)
+			frame_v3_next_log = frame_state.predictedDisplayTime + 5'000'000'000;
+		else if (frame_state.predictedDisplayTime >= frame_v3_next_log)
+		{
+			const double hz = 1'000'000'000.0 / double(frame_state.predictedDisplayPeriod);
+			spdlog::info(
+			        "Steam Frame v3: {:.2f} Hz, fresh={}, reprojection_ticks={}, common_misses={}, gui_stereo_fallbacks={}, regressions_rejected={}, eye_gaze={}",
+			        hz,
+			        frame_v3_fresh_frames,
+			        frame_v3_reprojection_ticks,
+			        frame_v3_common_misses,
+			        frame_v3_gui_stereo_fallbacks,
+			        frame_v3_regressions_rejected,
+			        application::get_config().check_feature(feature::eye_gaze));
+			frame_v3_next_log = frame_state.predictedDisplayTime + 5'000'000'000;
+		}
+	}
+
 	std::array<XrPosef, view_count> pose;
 	std::array<XrFovf, view_count> fov;
 	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation;

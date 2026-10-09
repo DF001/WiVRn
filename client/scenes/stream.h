@@ -90,6 +90,16 @@ private:
 	std::atomic<XrDuration> real_display_period = 0;
 	std::optional<std::thread> tracking_thread;
 
+	// Steam Frame v3 / 144 Hz low-latency diagnostics.
+	// These are render-thread-only and intentionally do not add locking.
+	std::optional<uint64_t> frame_v3_last_common_frame;
+	uint64_t frame_v3_fresh_frames = 0;
+	uint64_t frame_v3_reprojection_ticks = 0;
+	uint64_t frame_v3_common_misses = 0;
+	uint64_t frame_v3_gui_stereo_fallbacks = 0;
+	uint64_t frame_v3_regressions_rejected = 0;
+	XrTime frame_v3_next_log = 0;
+
 	std::shared_mutex decoder_mutex;
 	std::optional<to_headset::video_stream_description> video_stream_description;
 	std::array<accumulator_images, decoder_count> decoders; // Locked by decoder_mutex
