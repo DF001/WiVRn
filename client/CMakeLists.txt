@@ -142,6 +142,7 @@ endif()
 # Main sources
 #
 target_compile_definitions(wivrn PRIVATE "XR_USE_TIMESPEC=1")
+target_compile_definitions(wivrn PRIVATE WIVRN_STEAM_FRAME_EXPERIMENTS=$<BOOL:${WIVRN_STEAM_FRAME_EXPERIMENTS}>)
 
 file(GLOB LOCAL_SOURCE CONFIGURE_DEPENDS
     "*.cpp"
