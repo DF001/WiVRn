@@ -18,6 +18,7 @@
  */
 
 #include "application.h"
+#include "battery.h"
 #include "stream.h"
 #include "utils/overloaded.h"
 #include "wivrn_packets.h"
@@ -25,18 +26,757 @@
 #include "xr/face_tracker.h"
 #include "xr/fb_body_tracker.h"
 #include "xr/to_string.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <magic_enum.hpp>
 #include <magic_enum_containers.hpp>
 #include <ranges>
 #include <spdlog/spdlog.h>
 #include <thread>
 
-#ifdef __ANDROID__
-#include "android/battery.h"
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 
 namespace
 {
+
+bool frame_gaze_fix_enabled()
+{
+	static const bool enabled = [] {
+		if (const char * value = std::getenv("WIVRN_FRAME_GAZE_FIX"))
+			return std::strcmp(value, "0") != 0;
+		return bool(WIVRN_STEAM_FRAME_EXPERIMENTS);
+	}();
+	return enabled;
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+class steam_frame_eye_mmap
+{
+public:
+	enum class source
+	{
+		combined,
+		held,
+	};
+
+	struct sample
+	{
+		uint32_t sequence = 0;
+		double sample_time_raw = 0.0;
+		glm::vec3 direction{0.0f, 0.0f, -1.0f};
+		float left_uncertainty = 0.0f;
+		float right_uncertainty = 0.0f;
+		source selected = source::combined;
+	};
+
+private:
+	static constexpr const char * path = "/dev/shm/eye-server.mmap";
+	static constexpr size_t header_version = 0x000;
+	static constexpr size_t header_initialized = 0x004;
+	static constexpr size_t header_mutex = 0x008;
+	static constexpr size_t header_sequence = 0x038;
+
+	static constexpr uint32_t supported_version = 5;
+	static constexpr size_t expected_size = 0x4f21f;
+	static constexpr size_t record_base = 0x157;
+	static constexpr size_t producer_state = record_base + 0x00;
+	static constexpr size_t sample_time = record_base + 0x05;
+	static constexpr size_t post_left = record_base + 0x0d;
+	static constexpr size_t post_right = record_base + 0x19;
+	static constexpr size_t post_cov = record_base + 0x25;
+
+	static constexpr float eye_lost_threshold = 0.004f;
+	static constexpr float eye_found_threshold = 0.0025f;
+	static constexpr uint32_t recovery_samples_required = 3;
+
+	int fd = -1;
+	uint8_t * data = nullptr;
+	size_t size = 0;
+	pthread_mutex_t * metadata_mutex = nullptr;
+
+	bool left_good = false;
+	bool right_good = false;
+	bool source_ready = false;
+	bool have_seen_sequence = false;
+	uint32_t recovery_samples = 0;
+	uint32_t last_seen_sequence = 0;
+	std::optional<glm::vec3> last_good_direction;
+	double last_good_sample_time_raw = 0.0;
+	uint32_t last_good_sequence = 0;
+	source current_source = source::held;
+	std::optional<source> last_logged_source;
+
+	template <typename T>
+	T load(size_t offset) const
+	{
+		T value{};
+		std::memcpy(&value, data + offset, sizeof(value));
+		return value;
+	}
+
+	std::array<float, 3> load_vec3(size_t offset) const
+	{
+		std::array<float, 3> value{};
+		std::memcpy(value.data(), data + offset, sizeof(value));
+		return value;
+	}
+
+	std::array<float, 6> load_cov(size_t offset) const
+	{
+		std::array<float, 6> value{};
+		std::memcpy(value.data(), data + offset, sizeof(value));
+		return value;
+	}
+
+	static bool finite_vec(const std::array<float, 3> & value)
+	{
+		for (float component: value)
+		{
+			if (not std::isfinite(component))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	static std::optional<glm::vec3> normalize_vec(const std::array<float, 3> & value)
+	{
+		if (not finite_vec(value))
+		{
+			return std::nullopt;
+		}
+
+		glm::vec3 direction{value[0], value[1], value[2]};
+		const float length = glm::length(direction);
+		if (not std::isfinite(length) or length < 1e-6f)
+		{
+			return std::nullopt;
+		}
+		return direction / length;
+	}
+
+	static float uncertainty(const std::array<float, 6> & covariance, bool left)
+	{
+		const size_t base = left ? 0 : 3;
+		const float value = std::max(covariance[base], covariance[base + 2]);
+		return std::isfinite(value) ? value : INFINITY;
+	}
+
+	static bool update_eye_good(bool current, float value)
+	{
+		if (not std::isfinite(value))
+		{
+			return false;
+		}
+		if (current)
+		{
+			return value <= eye_lost_threshold;
+		}
+		return value <= eye_found_threshold;
+	}
+
+	bool lock()
+	{
+		if (metadata_mutex == nullptr)
+		{
+			return false;
+		}
+
+		const int result = pthread_mutex_lock(metadata_mutex);
+		if (result == 0)
+		{
+			return true;
+		}
+		if (result == EOWNERDEAD)
+		{
+			const int consistent = pthread_mutex_consistent(metadata_mutex);
+			if (consistent == 0)
+			{
+				return true;
+			}
+			pthread_mutex_unlock(metadata_mutex);
+		}
+		return false;
+	}
+
+	void unlock()
+	{
+		pthread_mutex_unlock(metadata_mutex);
+	}
+
+	void log_source(source selected, float left_unc, float right_unc)
+	{
+		if (last_logged_source and *last_logged_source == selected)
+		{
+			return;
+		}
+		last_logged_source = selected;
+
+		switch (selected)
+		{
+			case source::combined:
+				spdlog::info(
+				        "Steam Frame gaze v8 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
+				        left_unc,
+				        right_unc);
+				break;
+			case source::held:
+				spdlog::warn(
+				        "Steam Frame gaze v8 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
+				        left_unc,
+				        right_unc);
+				break;
+		}
+	}
+
+	bool open_mapping()
+	{
+		fd = ::open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+		{
+			spdlog::warn("Steam Frame gaze v8: cannot open {}: {}", path, std::strerror(errno));
+			return false;
+		}
+
+		struct stat st{};
+		if (fstat(fd, &st) != 0)
+		{
+			spdlog::warn("Steam Frame gaze v8: fstat failed: {}", std::strerror(errno));
+			::close(fd);
+			fd = -1;
+			return false;
+		}
+
+		size = size_t(st.st_size);
+		if (size < expected_size)
+		{
+			spdlog::warn(
+			        "Steam Frame gaze v8: eye mmap too small ({} bytes, need at least {})",
+			        size,
+			        expected_size);
+			::close(fd);
+			fd = -1;
+			return false;
+		}
+
+		void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (mapped == MAP_FAILED)
+		{
+			spdlog::warn("Steam Frame gaze v8: mmap failed: {}", std::strerror(errno));
+			::close(fd);
+			fd = -1;
+			return false;
+		}
+
+		data = static_cast<uint8_t *>(mapped);
+		metadata_mutex = reinterpret_cast<pthread_mutex_t *>(data + header_mutex);
+
+		const uint32_t version = load<uint32_t>(header_version);
+		const uint32_t initialized = load<uint32_t>(header_initialized);
+		if (version != supported_version or initialized != 1)
+		{
+			spdlog::warn(
+			        "Steam Frame gaze v8: unsupported eye mmap (version={}, initialized={})",
+			        version,
+			        initialized);
+			munmap(data, size);
+			data = nullptr;
+			metadata_mutex = nullptr;
+			::close(fd);
+			fd = -1;
+			return false;
+		}
+
+		spdlog::info(
+		        "Steam Frame gaze v8 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
+		return true;
+	}
+
+public:
+	explicit steam_frame_eye_mmap(bool enabled)
+	{
+		if (enabled)
+		{
+			open_mapping();
+		}
+	}
+
+	~steam_frame_eye_mmap()
+	{
+		if (data != nullptr)
+		{
+			munmap(data, size);
+		}
+		if (fd >= 0)
+		{
+			::close(fd);
+		}
+	}
+
+	steam_frame_eye_mmap(const steam_frame_eye_mmap &) = delete;
+	steam_frame_eye_mmap & operator=(const steam_frame_eye_mmap &) = delete;
+
+	bool active() const
+	{
+		return data != nullptr;
+	}
+
+	std::optional<sample> read()
+	{
+		if (data == nullptr or not lock())
+		{
+			return std::nullopt;
+		}
+
+		const uint32_t sequence = load<uint32_t>(header_sequence);
+		const uint32_t state = load<uint32_t>(producer_state);
+		const double timestamp = load<double>(sample_time);
+		const auto left_raw = load_vec3(post_left);
+		const auto right_raw = load_vec3(post_right);
+		const auto covariance = load_cov(post_cov);
+
+		unlock();
+
+		if (state != 1 or not std::isfinite(timestamp))
+		{
+			return std::nullopt;
+		}
+
+		const auto left = normalize_vec(left_raw);
+		const auto right = normalize_vec(right_raw);
+		const float left_unc = uncertainty(covariance, true);
+		const float right_unc = uncertainty(covariance, false);
+
+		const bool new_sequence = not have_seen_sequence or sequence != last_seen_sequence;
+		if (new_sequence)
+		{
+			have_seen_sequence = true;
+			last_seen_sequence = sequence;
+
+			left_good = left.has_value() and update_eye_good(left_good, left_unc);
+			right_good = right.has_value() and update_eye_good(right_good, right_unc);
+
+			std::optional<glm::vec3> combined;
+			if (left_good and right_good and left and right)
+			{
+				const glm::vec3 sum = *left + *right;
+				const float length = glm::length(sum);
+				if (std::isfinite(length) and length >= 1e-6f)
+				{
+					combined = sum / length;
+				}
+			}
+
+			if (combined)
+			{
+				if (not last_good_direction)
+				{
+					// At startup there is nothing useful to hold, so accept the first
+					// healthy binocular sample immediately.
+					source_ready = true;
+					recovery_samples = recovery_samples_required;
+				}
+				else if (not source_ready)
+				{
+					++recovery_samples;
+					if (recovery_samples >= recovery_samples_required)
+					{
+						source_ready = true;
+					}
+				}
+
+				if (source_ready)
+				{
+					last_good_direction = *combined;
+					last_good_sample_time_raw = timestamp;
+					last_good_sequence = sequence;
+					current_source = source::combined;
+					log_source(current_source, left_unc, right_unc);
+				}
+				else
+				{
+					current_source = source::held;
+					log_source(current_source, left_unc, right_unc);
+				}
+			}
+			else
+			{
+				source_ready = false;
+				recovery_samples = 0;
+				current_source = source::held;
+				log_source(current_source, left_unc, right_unc);
+			}
+		}
+
+		if (last_good_direction)
+		{
+			return sample{
+			        .sequence = last_good_sequence,
+			        .sample_time_raw = last_good_sample_time_raw,
+			        .direction = *last_good_direction,
+			        .left_uncertainty = left_unc,
+			        .right_uncertainty = right_unc,
+			        .selected = current_source,
+			};
+		}
+
+		return std::nullopt;
+	}
+
+	static glm::quat direction_to_quaternion(glm::vec3 direction)
+	{
+		direction = glm::normalize(direction);
+		const glm::vec3 forward{0.0f, 0.0f, -1.0f};
+		const float cosine = std::clamp(glm::dot(forward, direction), -1.0f, 1.0f);
+
+		if (cosine < -0.9999f)
+		{
+			return glm::quat(0.0f, 0.0f, 1.0f, 0.0f);
+		}
+
+		const glm::vec3 axis = glm::cross(forward, direction);
+		const float s = std::sqrt((1.0f + cosine) * 2.0f);
+		const float inverse_s = 1.0f / s;
+
+		return glm::normalize(glm::quat(
+		        s * 0.5f,
+		        axis.x * inverse_s,
+		        axis.y * inverse_s,
+		        axis.z * inverse_s));
+	}
+};
+#else
+class steam_frame_eye_mmap
+{
+public:
+	struct sample
+	{
+		uint32_t sequence = 0;
+		double sample_time_raw = 0.0;
+		glm::vec3 direction{0.0f, 0.0f, -1.0f};
+	};
+
+	explicit steam_frame_eye_mmap(bool)
+	{
+	}
+
+	bool active() const
+	{
+		return false;
+	}
+
+	std::optional<sample> read()
+	{
+		return std::nullopt;
+	}
+
+	static glm::quat direction_to_quaternion(glm::vec3)
+	{
+		return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+	}
+};
+#endif
+
+class frame_gaze_stabilizer
+{
+	std::optional<glm::quat> fixation;
+	std::optional<glm::quat> pending_target;
+	XrTime last_source_update_frame = 0;
+
+	std::optional<glm::quat> temporal_output;
+	XrTime last_temporal_frame = 0;
+	uint32_t temporal_fast_frames_remaining = 0;
+
+	uint64_t requests = 0;
+	uint64_t source_updates = 0;
+	uint64_t held_requests = 0;
+	uint64_t deadband_holds = 0;
+	uint64_t pending_changes = 0;
+	uint64_t rejected_candidates = 0;
+	uint64_t confirmed_moves = 0;
+	uint64_t confirmed_saccades = 0;
+	uint64_t temporal_updates = 0;
+	uint64_t temporal_slow_updates = 0;
+	uint64_t temporal_medium_updates = 0;
+	uint64_t temporal_fast_updates = 0;
+	XrTime next_log = 0;
+
+	static constexpr float fixation_radius_rad = 0.85f * M_PI / 180.0f;
+	static constexpr float confirmation_tolerance_rad = 1.50f * M_PI / 180.0f;
+	static constexpr float saccade_rad = 5.0f * M_PI / 180.0f;
+
+	// Adaptive temporal smoothing runs once per Steam Frame display/tracking frame.
+	// Small residual motion gets strong smoothing, medium motion stays responsive,
+	// and a confirmed >=5 degree saccade gets three fast frames before returning
+	// to the normal adaptive bands.
+	static constexpr float temporal_slow_angle_rad = 1.0f * M_PI / 180.0f;
+	static constexpr float temporal_slow_tau_seconds = 0.050f;
+	static constexpr float temporal_medium_tau_seconds = 0.025f;
+	static constexpr float temporal_fast_tau_seconds = 0.008f;
+	static constexpr uint32_t temporal_fast_frames_after_saccade = 3;
+
+	static glm::quat align_hemisphere(const glm::quat & reference, glm::quat value)
+	{
+		if (glm::dot(reference, value) < 0.0f)
+		{
+			value = glm::quat(-value.w, -value.x, -value.y, -value.z);
+		}
+		return value;
+	}
+
+	static float angular_distance(const glm::quat & a, const glm::quat & b)
+	{
+		glm::quat aligned = align_hemisphere(a, b);
+		float d = std::clamp(glm::dot(a, aligned), 0.0f, 1.0f);
+		return 2.0f * std::acos(d);
+	}
+
+	static glm::quat normalized_blend(const glm::quat & a, glm::quat b, float alpha)
+	{
+		b = align_hemisphere(a, b);
+		return glm::normalize(glm::quat(
+		        a.w + alpha * (b.w - a.w),
+		        a.x + alpha * (b.x - a.x),
+		        a.y + alpha * (b.y - a.y),
+		        a.z + alpha * (b.z - a.z)));
+	}
+
+	void start_fixation(glm::quat raw)
+	{
+		fixation = glm::normalize(raw);
+		pending_target.reset();
+	}
+
+	// Keep stationary world-space gaze steady within a small deadband. The
+	// Frame eye-server sometimes reports isolated 5-6 degree jumps at rest;
+	// require two consecutive NEW source samples to agree before moving.
+	void accept_confirmed_motion(glm::quat raw)
+	{
+		const float shift = angular_distance(*fixation, raw);
+		start_fixation(raw);
+		++confirmed_moves;
+		if (shift >= saccade_rad)
+		{
+			temporal_fast_frames_remaining = temporal_fast_frames_after_saccade;
+			++confirmed_saccades;
+		}
+	}
+
+	void consider_source_sample(glm::quat raw)
+	{
+		const float angle = angular_distance(*fixation, raw);
+		if (angle <= fixation_radius_rad)
+		{
+			if (pending_target)
+			{
+				pending_target.reset();
+				++rejected_candidates;
+			}
+			++deadband_holds;
+			return;
+		}
+
+		if (pending_target)
+		{
+			const float agreement = angular_distance(*pending_target, raw);
+			if (agreement <= confirmation_tolerance_rad)
+			{
+				const glm::quat confirmed = normalized_blend(*pending_target, raw, 0.5f);
+				if (angular_distance(*fixation, confirmed) > fixation_radius_rad)
+				{
+					accept_confirmed_motion(confirmed);
+					return;
+				}
+			}
+			++rejected_candidates;
+		}
+
+		pending_target = raw;
+		++pending_changes;
+	}
+
+	void advance_temporal(XrTime temporal_frame_key)
+	{
+		if (not fixation)
+		{
+			return;
+		}
+
+		if (not temporal_output)
+		{
+			temporal_output = *fixation;
+			last_temporal_frame = temporal_frame_key;
+			++temporal_updates;
+			return;
+		}
+
+		if (temporal_frame_key == last_temporal_frame)
+		{
+			return;
+		}
+
+		if (temporal_frame_key < last_temporal_frame)
+		{
+			// A tracking-pattern reset must never drive the filter backwards.
+			last_temporal_frame = temporal_frame_key;
+			return;
+		}
+
+		const float dt_seconds = std::clamp(
+		        float(temporal_frame_key - last_temporal_frame) * 1e-9f,
+		        0.001f,
+		        0.025f);
+		last_temporal_frame = temporal_frame_key;
+
+		const float angle = angular_distance(*temporal_output, *fixation);
+		float tau_seconds;
+
+		if (temporal_fast_frames_remaining > 0)
+		{
+			tau_seconds = temporal_fast_tau_seconds;
+			--temporal_fast_frames_remaining;
+			++temporal_fast_updates;
+		}
+		else if (angle < temporal_slow_angle_rad)
+		{
+			tau_seconds = temporal_slow_tau_seconds;
+			++temporal_slow_updates;
+		}
+		else if (angle < saccade_rad)
+		{
+			tau_seconds = temporal_medium_tau_seconds;
+			++temporal_medium_updates;
+		}
+		else
+		{
+			tau_seconds = temporal_fast_tau_seconds;
+			++temporal_fast_updates;
+		}
+
+		const float alpha = 1.0f - std::exp(-dt_seconds / tau_seconds);
+		temporal_output = normalized_blend(*temporal_output, *fixation, alpha);
+		++temporal_updates;
+	}
+
+public:
+	void apply(
+	        from_headset::tracking::pose & pose,
+	        XrTime timestamp,
+	        XrTime source_frame_key,
+	        XrTime temporal_frame_key,
+	        bool canonical_sample)
+	{
+		++requests;
+
+		using flags = from_headset::pose_flags;
+		const uint8_t orientation_ok =
+		        uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked);
+		if ((pose.flags & orientation_ok) != orientation_ok)
+		{
+			return;
+		}
+
+		glm::quat raw(
+		        pose.pose.orientation.w,
+		        pose.pose.orientation.x,
+		        pose.pose.orientation.y,
+		        pose.pose.orientation.z);
+		raw = glm::normalize(raw);
+
+		if (not fixation)
+		{
+			start_fixation(raw);
+			last_source_update_frame = source_frame_key;
+			++source_updates;
+		}
+		else if (canonical_sample and source_frame_key != last_source_update_frame)
+		{
+			last_source_update_frame = source_frame_key;
+			++source_updates;
+
+			consider_source_sample(raw);
+		}
+		else
+		{
+			++held_requests;
+		}
+
+		advance_temporal(temporal_frame_key);
+
+		const glm::quat & output = temporal_output ? *temporal_output : *fixation;
+		pose.pose.orientation = {
+		        .x = output.x,
+		        .y = output.y,
+		        .z = output.z,
+		        .w = output.w,
+		};
+
+		pose.angular_velocity = {};
+		pose.flags &= ~uint8_t(flags::angular_velocity_valid);
+
+		if (next_log == 0)
+		{
+			next_log = timestamp + 5'000'000'000;
+		}
+		else if (timestamp >= next_log)
+		{
+			spdlog::info(
+			        "Steam Frame gaze v8: requests={}, source_updates={}, request_holds={}, hardlocked={}, pending={}, rejected={}, confirmed={}, confirmed_saccades={}, temporal_updates={} (slow={}, medium={}, fast={})",
+			        requests,
+			        source_updates,
+			        held_requests,
+			        deadband_holds,
+			        pending_changes,
+			        rejected_candidates,
+			        confirmed_moves,
+			        confirmed_saccades,
+			        temporal_updates,
+			        temporal_slow_updates,
+			        temporal_medium_updates,
+			        temporal_fast_updates);
+			next_log = timestamp + 5'000'000'000;
+		}
+	}
+};
+
+std::optional<glm::quat> tracked_orientation(const from_headset::tracking::pose & pose)
+{
+	using flags = from_headset::pose_flags;
+	const uint8_t orientation_ok =
+	        uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked);
+
+	if ((pose.flags & orientation_ok) != orientation_ok)
+	{
+		return std::nullopt;
+	}
+
+	glm::quat orientation(
+	        pose.pose.orientation.w,
+	        pose.pose.orientation.x,
+	        pose.pose.orientation.y,
+	        pose.pose.orientation.z);
+
+	const float length = glm::length(orientation);
+	if (not std::isfinite(length) or length < 1e-6f)
+	{
+		return std::nullopt;
+	}
+
+	return orientation / length;
+}
 
 from_headset::tracking::pose locate_space(device_id device, XrSpace space, XrSpace reference, XrTime time)
 {
@@ -233,10 +973,10 @@ void scenes::stream::tracking()
 #ifdef __ANDROID__
 	// Runtime may use JNI and needs the thread to be attached
 	application::instance().setup_jni();
+#endif
 
 	XrTime next_battery_check = 0;
 	const XrDuration battery_check_interval = 30'000'000'000; // 30s
-#endif
 
 	magic_enum::containers::array<device_id, XrSpace> spaces{};
 
@@ -310,6 +1050,25 @@ void scenes::stream::tracking()
 
 	XrDuration frame_duration{};
 	XrTime pattern_begin = instance.now();
+	frame_gaze_stabilizer gaze_stabilizer;
+	steam_frame_eye_mmap frame_eye_mmap(frame_gaze_fix_enabled());
+	std::optional<XrDuration> gaze_canonical_prediction_ns;
+
+	std::optional<glm::quat> frame_world_gaze;
+	uint32_t frame_world_gaze_sequence = 0;
+	bool frame_world_gaze_have_sequence = false;
+	uint64_t frame_world_compensated_samples = 0;
+	uint64_t frame_world_reprojections = 0;
+	uint64_t frame_world_compensation_failures = 0;
+	double frame_world_sample_age_sum_ms = 0.0;
+	double frame_world_sample_age_max_ms = 0.0;
+	XrTime frame_world_next_log = 0;
+
+	if (frame_gaze_fix_enabled())
+	{
+		spdlog::info(
+		        "Steam Frame gaze v8 active: timestamp-corrected world-space binocular mmap + confirmed two-sample hard fixation (0.85/1.50 deg), 144 Hz adaptive temporal (50/25/8 ms)");
+	}
 
 	while (state_ != state::shutdown)
 	{
@@ -386,6 +1145,21 @@ void scenes::stream::tracking()
 						}
 						else
 							body_tracker.emplace<std::monostate>();
+					}
+
+					gaze_canonical_prediction_ns.reset();
+					for (const auto & item: pattern)
+					{
+						if (item.device != device_id::EYE_GAZE)
+						{
+							continue;
+						}
+
+						if (not gaze_canonical_prediction_ns or
+						    std::abs(item.prediction_ns) < std::abs(*gaze_canonical_prediction_ns))
+						{
+							gaze_canonical_prediction_ns = item.prediction_ns;
+						}
 					}
 
 					std::ranges::sort(pattern, std::less{}, [frame_duration](const auto & i) { return -i.prediction_ns % frame_duration; });
@@ -467,35 +1241,224 @@ void scenes::stream::tracking()
 						case wivrn::device_id::RIGHT_POKE:
 							locate_spaces.add_space(item.device, spaces[item.device], tracking.timestamp, tracking.device_poses);
 							break;
-						case wivrn::device_id::EYE_GAZE:
-							// Eye gaze uses view pose as the origin
-							if (application::get_hmd_traits().view_locate)
-								tracking.device_poses.push_back(locate_space(item.device, spaces[item.device], spaces[wivrn::device_id::HEAD], tracking.timestamp));
-							else
+						case wivrn::device_id::EYE_GAZE: {
+							bool used_frame_mmap = false;
+
+							if (frame_gaze_fix_enabled() and frame_eye_mmap.active())
 							{
-								// Pico headsets fail to locate gaze relative to view
-								auto gaze = locate_space(item.device, spaces[item.device], height_offset_space, tracking.timestamp);
-								auto view_pose = locate_space(item.device, view_space, height_offset_space, tracking.timestamp);
-								glm::quat gaze_quat(gaze.pose.orientation.w, gaze.pose.orientation.x, gaze.pose.orientation.y, gaze.pose.orientation.z);
-								glm::quat view_quat(view_pose.pose.orientation.w, view_pose.pose.orientation.x, view_pose.pose.orientation.y, view_pose.pose.orientation.z);
-								gaze_quat = glm::conjugate(view_quat) * gaze_quat;
-								using flags = from_headset::pose_flags;
-								tracking.device_poses.push_back(
-								        from_headset::tracking::pose{
-								                // Zero position and velocities
-								                .pose = {
-								                        .orientation = {
-								                                .x = gaze_quat.x,
-								                                .y = gaze_quat.y,
-								                                .z = gaze_quat.z,
-								                                .w = gaze_quat.w,
-								                        },
-								                },
-								                .device = item.device,
-								                .flags = uint8_t(gaze.flags & view_pose.flags & ~(flags::linear_velocity_valid | flags::angular_velocity_valid)),
-								        });
+								if (auto mmap_sample = frame_eye_mmap.read())
+								{
+									// The private mmap ray is head-relative at its own sample time.
+									// Convert each new accepted source sample into world space using the
+									// head pose at that eye timestamp. The stabilizer then operates in
+									// world space, so natural eye counter-rotation from head motion is
+									// not mistaken for gaze drift. Every requested output is converted
+									// back to head-relative using the head pose at tracking.timestamp.
+									used_frame_mmap = true;
+
+									const auto current_head_pose = locate_space(
+									        device_id::HEAD,
+									        view_space,
+									        height_offset_space,
+									        tracking.timestamp);
+									const auto current_head = tracked_orientation(current_head_pose);
+
+									const bool new_world_source =
+									        not frame_world_gaze_have_sequence or
+									        mmap_sample->sequence != frame_world_gaze_sequence;
+
+									if (new_world_source)
+									{
+										timespec raw_now_ts{};
+										if (clock_gettime(CLOCK_MONOTONIC_RAW, &raw_now_ts) == 0)
+										{
+											const double raw_now =
+											        double(raw_now_ts.tv_sec) + double(raw_now_ts.tv_nsec) * 1e-9;
+											const double age_seconds = raw_now - mmap_sample->sample_time_raw;
+
+											// A fresh accepted sample measured ~17 ms old on the Frame.
+											// Reject impossible clock values rather than mixing coordinate spaces.
+											if (std::isfinite(age_seconds) and age_seconds >= 0.0 and age_seconds <= 0.250)
+											{
+												const XrTime xr_now = instance.now();
+												const XrDuration age_ns = XrDuration(std::llround(age_seconds * 1e9));
+												const XrTime eye_sample_time = xr_now - age_ns;
+												const auto sample_head_pose = locate_space(
+												        device_id::HEAD,
+												        view_space,
+												        height_offset_space,
+												        eye_sample_time);
+												const auto sample_head = tracked_orientation(sample_head_pose);
+
+												if (sample_head)
+												{
+													const glm::quat head_relative_gaze =
+													        steam_frame_eye_mmap::direction_to_quaternion(mmap_sample->direction);
+													frame_world_gaze = glm::normalize(*sample_head * head_relative_gaze);
+													frame_world_gaze_sequence = mmap_sample->sequence;
+													frame_world_gaze_have_sequence = true;
+
+													const double age_ms = age_seconds * 1000.0;
+													frame_world_sample_age_sum_ms += age_ms;
+													frame_world_sample_age_max_ms =
+													        std::max(frame_world_sample_age_max_ms, age_ms);
+													++frame_world_compensated_samples;
+												}
+												else
+												{
+													++frame_world_compensation_failures;
+												}
+											}
+											else
+											{
+												++frame_world_compensation_failures;
+											}
+										}
+										else
+										{
+											++frame_world_compensation_failures;
+										}
+									}
+
+									if (frame_world_gaze and current_head)
+									{
+										using flags = from_headset::pose_flags;
+										from_headset::tracking::pose gaze_pose{
+										        .pose = {
+										                .orientation = {
+										                        .x = frame_world_gaze->x,
+										                        .y = frame_world_gaze->y,
+										                        .z = frame_world_gaze->z,
+										                        .w = frame_world_gaze->w,
+										                },
+										        },
+										        .device = item.device,
+										        .flags = uint8_t(flags::orientation_valid) | uint8_t(flags::orientation_tracked),
+										};
+
+										gaze_stabilizer.apply(
+										        gaze_pose,
+										        tracking.timestamp,
+										        XrTime(frame_world_gaze_sequence),
+										        pattern_begin,
+										        true);
+
+										const glm::quat stabilized_world(
+										        gaze_pose.pose.orientation.w,
+										        gaze_pose.pose.orientation.x,
+										        gaze_pose.pose.orientation.y,
+										        gaze_pose.pose.orientation.z);
+										const glm::quat head_relative_output =
+										        glm::normalize(glm::conjugate(*current_head) * stabilized_world);
+
+										gaze_pose.pose.orientation = {
+										        .x = head_relative_output.x,
+										        .y = head_relative_output.y,
+										        .z = head_relative_output.z,
+										        .w = head_relative_output.w,
+										};
+										tracking.device_poses.push_back(gaze_pose);
+										++frame_world_reprojections;
+									}
+									else if (not current_head)
+									{
+										++frame_world_compensation_failures;
+									}
+
+									if (frame_world_next_log == 0)
+									{
+										frame_world_next_log = tracking.timestamp + 5'000'000'000;
+									}
+									else if (tracking.timestamp >= frame_world_next_log)
+									{
+										const double average_age_ms =
+										        frame_world_compensated_samples > 0
+										                ? frame_world_sample_age_sum_ms / double(frame_world_compensated_samples)
+										                : 0.0;
+										spdlog::info(
+										        "Steam Frame gaze v8 world: compensated_samples={}, reprojections={}, failures={}, sample_age_avg={:.2f} ms, sample_age_max={:.2f} ms",
+										        frame_world_compensated_samples,
+										        frame_world_reprojections,
+										        frame_world_compensation_failures,
+										        average_age_ms,
+										        frame_world_sample_age_max_ms);
+										frame_world_next_log = tracking.timestamp + 5'000'000'000;
+									}
+								}
+							}
+
+							if (not used_frame_mmap)
+							{
+								if (application::get_hmd_traits().view_locate and not frame_gaze_fix_enabled())
+								{
+									tracking.device_poses.push_back(
+									        locate_space(
+									                item.device,
+									                spaces[item.device],
+									                spaces[wivrn::device_id::HEAD],
+									                tracking.timestamp));
+								}
+								else
+								{
+									auto gaze =
+									        locate_space(
+									                item.device,
+									                spaces[item.device],
+									                height_offset_space,
+									                tracking.timestamp);
+									auto view_pose =
+									        locate_space(
+									                item.device,
+									                view_space,
+									                height_offset_space,
+									                tracking.timestamp);
+
+									glm::quat gaze_quat(
+									        gaze.pose.orientation.w,
+									        gaze.pose.orientation.x,
+									        gaze.pose.orientation.y,
+									        gaze.pose.orientation.z);
+									glm::quat view_quat(
+									        view_pose.pose.orientation.w,
+									        view_pose.pose.orientation.x,
+									        view_pose.pose.orientation.y,
+									        view_pose.pose.orientation.z);
+									gaze_quat = glm::conjugate(view_quat) * gaze_quat;
+
+									using flags = from_headset::pose_flags;
+									tracking.device_poses.push_back(
+									        from_headset::tracking::pose{
+									                .pose = {
+									                        .orientation = {
+									                                .x = gaze_quat.x,
+									                                .y = gaze_quat.y,
+									                                .z = gaze_quat.z,
+									                                .w = gaze_quat.w,
+									                        },
+									                },
+									                .device = item.device,
+									                .flags = uint8_t(gaze.flags & view_pose.flags & ~(flags::linear_velocity_valid | flags::angular_velocity_valid)),
+									        });
+								}
+
+								if (frame_gaze_fix_enabled() and
+								    not tracking.device_poses.empty() and
+								    tracking.device_poses.back().device == wivrn::device_id::EYE_GAZE)
+								{
+									const bool canonical_sample =
+									        gaze_canonical_prediction_ns and
+									        item.prediction_ns == *gaze_canonical_prediction_ns;
+
+									gaze_stabilizer.apply(
+									        tracking.device_poses.back(),
+									        tracking.timestamp,
+									        pattern_begin,
+									        pattern_begin,
+									        canonical_sample);
+								}
 							}
 							break;
+						}
 						case wivrn::device_id::FACE:
 							std::visit(utils::overloaded{
 							                   [](std::monostate &) {},
@@ -550,7 +1513,6 @@ void scenes::stream::tracking()
 					throw;
 			}
 
-#ifdef __ANDROID__
 			// FIXME: switch to event based
 			if (next_battery_check < now)
 			{
@@ -563,7 +1525,6 @@ void scenes::stream::tracking()
 
 				next_battery_check = now + battery_check_interval;
 			}
-#endif
 
 			if (auto fb = std::get_if<xr::fb_body_tracker>(&body_tracker); fb and fb->should_send_skeleton())
 			{

@@ -120,6 +120,10 @@ else()
             "decoder/ffmpeg/*.cpp")
     endif()
 
+    file(GLOB CLIENT_LINUX_SOURCE CONFIGURE_DEPENDS
+        "linux/*.cpp")
+    list(APPEND PLATFORM_SOURCE ${CLIENT_LINUX_SOURCE})
+
     if(WIVRN_USE_PIPEWIRE)
         file(GLOB CLIENT_PIPEWIRE_SOURCE CONFIGURE_DEPENDS
             "audio/linux/*.cpp")
@@ -138,6 +142,7 @@ endif()
 # Main sources
 #
 target_compile_definitions(wivrn PRIVATE "XR_USE_TIMESPEC=1")
+target_compile_definitions(wivrn PRIVATE WIVRN_STEAM_FRAME_EXPERIMENTS=$<BOOL:${WIVRN_STEAM_FRAME_EXPERIMENTS}>)
 
 file(GLOB LOCAL_SOURCE CONFIGURE_DEPENDS
     "*.cpp"
