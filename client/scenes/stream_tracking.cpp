@@ -68,6 +68,8 @@ public:
 	enum class source
 	{
 		combined,
+		left,
+		right,
 		held,
 	};
 
@@ -229,13 +231,25 @@ private:
 		{
 			case source::combined:
 				spdlog::info(
-				        "Steam Frame gaze v8 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v10 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
+				        left_unc,
+				        right_unc);
+				break;
+			case source::left:
+				spdlog::info(
+				        "Steam Frame gaze v10 source: LEFT ONLY (left_unc={:.6f}, right_unc={:.6f})",
+				        left_unc,
+				        right_unc);
+				break;
+			case source::right:
+				spdlog::info(
+				        "Steam Frame gaze v10 source: RIGHT ONLY (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::held:
 				spdlog::warn(
-				        "Steam Frame gaze v8 source: HOLD last stable combined gaze (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v10 source: HOLD last stable gaze (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
@@ -247,14 +261,14 @@ private:
 		fd = ::open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 		{
-			spdlog::warn("Steam Frame gaze v8: cannot open {}: {}", path, std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v10: cannot open {}: {}", path, std::strerror(errno));
 			return false;
 		}
 
 		struct stat st{};
 		if (fstat(fd, &st) != 0)
 		{
-			spdlog::warn("Steam Frame gaze v8: fstat failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v10: fstat failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -264,7 +278,7 @@ private:
 		if (size < expected_size)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v8: eye mmap too small ({} bytes, need at least {})",
+			        "Steam Frame gaze v10: eye mmap too small ({} bytes, need at least {})",
 			        size,
 			        expected_size);
 			::close(fd);
@@ -275,7 +289,7 @@ private:
 		void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (mapped == MAP_FAILED)
 		{
-			spdlog::warn("Steam Frame gaze v8: mmap failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v10: mmap failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -289,7 +303,7 @@ private:
 		if (version != supported_version or initialized != 1)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v8: unsupported eye mmap (version={}, initialized={})",
+			        "Steam Frame gaze v10: unsupported eye mmap (version={}, initialized={})",
 			        version,
 			        initialized);
 			munmap(data, size);
@@ -301,7 +315,7 @@ private:
 		}
 
 		spdlog::info(
-		        "Steam Frame gaze v8 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
+		        "Steam Frame gaze v10 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
 		return true;
 	}
 
@@ -380,12 +394,28 @@ public:
 				}
 			}
 
-			if (combined)
+			// The eye-server reports head-relative POST rays for both eyes. A
+			// failing eye must not freeze tracking while the other eye remains
+			// healthy. Prefer fused binocular gaze; otherwise choose one healthy
+			// POST ray. Preserve conservative per-eye covariance hysteresis.
+			std::optional<glm::vec3> candidate = combined;
+			source selected = source::combined;
+			if (not candidate and left_good and left)
+			{
+				candidate = *left;
+				selected = source::left;
+			}
+			else if (not candidate and right_good and right)
+			{
+				candidate = *right;
+				selected = source::right;
+			}
+
+			if (candidate)
 			{
 				if (not last_good_direction)
 				{
-					// At startup there is nothing useful to hold, so accept the first
-					// healthy binocular sample immediately.
+					// No previous gaze to hold: accept first usable eye.
 					source_ready = true;
 					recovery_samples = recovery_samples_required;
 				}
@@ -400,10 +430,10 @@ public:
 
 				if (source_ready)
 				{
-					last_good_direction = *combined;
+					last_good_direction = *candidate;
 					last_good_sample_time_raw = timestamp;
 					last_good_sequence = sequence;
-					current_source = source::combined;
+					current_source = selected;
 					log_source(current_source, left_unc, right_unc);
 				}
 				else
@@ -419,6 +449,7 @@ public:
 				current_source = source::held;
 				log_source(current_source, left_unc, right_unc);
 			}
+
 		}
 
 		if (last_good_direction)
@@ -493,8 +524,17 @@ public:
 class frame_gaze_stabilizer
 {
 	std::optional<glm::quat> fixation;
-	std::optional<glm::quat> pending_target;
+	std::optional<glm::quat> pending_anchor;
+	std::optional<glm::quat> pending_mean;
+	uint32_t pending_samples = 0;
 	XrTime last_source_update_frame = 0;
+	std::optional<glm::quat> last_raw_sample;
+	uint64_t raw_step_count = 0;
+	double raw_step_squared_degrees = 0.0;
+	std::optional<glm::quat> last_output_sample;
+	uint64_t output_step_count = 0;
+	XrTime last_output_measured_frame = 0;
+	double output_step_squared_degrees = 0.0;
 
 	std::optional<glm::quat> temporal_output;
 	XrTime last_temporal_frame = 0;
@@ -507,16 +547,24 @@ class frame_gaze_stabilizer
 	uint64_t pending_changes = 0;
 	uint64_t rejected_candidates = 0;
 	uint64_t confirmed_moves = 0;
+	uint64_t confirmed_micro = 0;
+	uint64_t confirmed_medium = 0;
 	uint64_t confirmed_saccades = 0;
+	uint64_t reacquisitions = 0;
+	uint64_t previous_logged_source_updates = 0;
+	XrTime previous_log_timestamp = 0;
 	uint64_t temporal_updates = 0;
 	uint64_t temporal_slow_updates = 0;
 	uint64_t temporal_medium_updates = 0;
 	uint64_t temporal_fast_updates = 0;
 	XrTime next_log = 0;
 
-	static constexpr float fixation_radius_rad = 0.85f * M_PI / 180.0f;
-	static constexpr float confirmation_tolerance_rad = 1.50f * M_PI / 180.0f;
+	static constexpr float fixation_radius_rad = 1.15f * M_PI / 180.0f;
+	static constexpr float medium_motion_rad = 2.40f * M_PI / 180.0f;
 	static constexpr float saccade_rad = 5.0f * M_PI / 180.0f;
+	static constexpr float micro_confirmation_tolerance_rad = 0.75f * M_PI / 180.0f;
+	static constexpr float medium_confirmation_tolerance_rad = 1.00f * M_PI / 180.0f;
+	static constexpr float large_confirmation_tolerance_rad = 1.50f * M_PI / 180.0f;
 
 	// Adaptive temporal smoothing runs once per Steam Frame display/tracking frame.
 	// Small residual motion gets strong smoothing, medium motion stays responsive,
@@ -557,12 +605,44 @@ class frame_gaze_stabilizer
 	void start_fixation(glm::quat raw)
 	{
 		fixation = glm::normalize(raw);
-		pending_target.reset();
+		clear_pending();
 	}
 
-	// Keep stationary world-space gaze steady within a small deadband. The
-	// Frame eye-server sometimes reports isolated 5-6 degree jumps at rest;
-	// require two consecutive NEW source samples to agree before moving.
+	// The source sometimes supplies two similar noisy samples. Preserve a stable
+	// fixation during small, correlated fluctuations. Demand longer agreement
+	// for micro-movements, but confirm intentional large jumps quickly.
+	// Only NEW source sequences enter this state machine, not 144 Hz reprojects.
+	static uint32_t micro_samples_required()
+	{
+		static const uint32_t samples = [] {
+			if (const char * value = std::getenv("WIVRN_FRAME_GAZE_V10_MICRO_SAMPLES"))
+			{
+				const int n = std::atoi(value);
+				if (n >= 2 and n <= 8)
+				{
+					return uint32_t(n);
+				}
+			}
+			return uint32_t(3);
+		}();
+		return samples;
+	}
+
+	void start_pending(glm::quat raw)
+	{
+		pending_anchor = raw;
+		pending_mean = raw;
+		pending_samples = 1;
+		++pending_changes;
+	}
+
+	void clear_pending()
+	{
+		pending_anchor.reset();
+		pending_mean.reset();
+		pending_samples = 0;
+	}
+
 	void accept_confirmed_motion(glm::quat raw)
 	{
 		const float shift = angular_distance(*fixation, raw);
@@ -573,6 +653,14 @@ class frame_gaze_stabilizer
 			temporal_fast_frames_remaining = temporal_fast_frames_after_saccade;
 			++confirmed_saccades;
 		}
+		else if (shift >= medium_motion_rad)
+		{
+			++confirmed_medium;
+		}
+		else
+		{
+			++confirmed_micro;
+		}
 	}
 
 	void consider_source_sample(glm::quat raw)
@@ -580,32 +668,53 @@ class frame_gaze_stabilizer
 		const float angle = angular_distance(*fixation, raw);
 		if (angle <= fixation_radius_rad)
 		{
-			if (pending_target)
+			if (pending_anchor)
 			{
-				pending_target.reset();
+				clear_pending();
 				++rejected_candidates;
 			}
 			++deadband_holds;
 			return;
 		}
 
-		if (pending_target)
+		if (not pending_anchor)
 		{
-			const float agreement = angular_distance(*pending_target, raw);
-			if (agreement <= confirmation_tolerance_rad)
-			{
-				const glm::quat confirmed = normalized_blend(*pending_target, raw, 0.5f);
-				if (angular_distance(*fixation, confirmed) > fixation_radius_rad)
-				{
-					accept_confirmed_motion(confirmed);
-					return;
-				}
-			}
-			++rejected_candidates;
+			start_pending(raw);
+			return;
 		}
 
-		pending_target = raw;
-		++pending_changes;
+		// Never let the candidate's moving mean walk away from its original
+		// position; otherwise a slowly drifting sensor can masquerade as intent.
+		const float candidate_angle = angular_distance(*fixation, *pending_mean);
+		const float anchor_tolerance =
+		        std::max(angle, candidate_angle) >= saccade_rad ? large_confirmation_tolerance_rad :
+		        std::max(angle, candidate_angle) >= medium_motion_rad ? medium_confirmation_tolerance_rad :
+		                                                                   micro_confirmation_tolerance_rad;
+
+		if (angular_distance(*pending_anchor, raw) > anchor_tolerance)
+		{
+			++rejected_candidates;
+			start_pending(raw);
+			return;
+		}
+
+		++pending_samples;
+		*pending_mean = normalized_blend(*pending_mean, raw, 1.0f / float(pending_samples));
+		const float candidate_shift = angular_distance(*fixation, *pending_mean);
+		if (candidate_shift <= fixation_radius_rad)
+		{
+			++rejected_candidates;
+			clear_pending();
+			return;
+		}
+
+		const uint32_t samples_needed =
+		        candidate_shift >= saccade_rad ? 2 :
+		        candidate_shift >= medium_motion_rad ? 3 : micro_samples_required();
+		if (pending_samples >= samples_needed)
+		{
+			accept_confirmed_motion(*pending_mean);
+		}
 	}
 
 	void advance_temporal(XrTime temporal_frame_key)
@@ -672,6 +781,22 @@ class frame_gaze_stabilizer
 	}
 
 public:
+	// Called once after the eye-server resumes after a stale interval.
+	// Reset temporal history, not cumulative statistics.
+	void reset_after_tracking_loss()
+	{
+		fixation.reset();
+		clear_pending();
+		last_source_update_frame = 0;
+		last_raw_sample.reset();
+		last_output_sample.reset();
+		last_output_measured_frame = 0;
+		temporal_output.reset();
+		last_temporal_frame = 0;
+		temporal_fast_frames_remaining = 0;
+		++reacquisitions;
+	}
+
 	void apply(
 	        from_headset::tracking::pose & pose,
 	        XrTime timestamp,
@@ -707,6 +832,13 @@ public:
 			last_source_update_frame = source_frame_key;
 			++source_updates;
 
+			if (last_raw_sample)
+			{
+				const double change_deg = double(angular_distance(*last_raw_sample, raw)) * 180.0 / M_PI;
+				raw_step_squared_degrees += change_deg * change_deg;
+				++raw_step_count;
+			}
+			last_raw_sample = raw;
 			consider_source_sample(raw);
 		}
 		else
@@ -717,6 +849,17 @@ public:
 		advance_temporal(temporal_frame_key);
 
 		const glm::quat & output = temporal_output ? *temporal_output : *fixation;
+		if (temporal_frame_key != last_output_measured_frame and last_output_sample)
+		{
+			const double change_deg = double(angular_distance(*last_output_sample, output)) * 180.0 / M_PI;
+			output_step_squared_degrees += change_deg * change_deg;
+			++output_step_count;
+		}
+		if (temporal_frame_key != last_output_measured_frame)
+		{
+			last_output_sample = output;
+			last_output_measured_frame = temporal_frame_key;
+		}
 		pose.pose.orientation = {
 		        .x = output.x,
 		        .y = output.y,
@@ -730,23 +873,45 @@ public:
 		if (next_log == 0)
 		{
 			next_log = timestamp + 5'000'000'000;
+			previous_log_timestamp = timestamp;
+			previous_logged_source_updates = source_updates;
 		}
 		else if (timestamp >= next_log)
 		{
+			const double elapsed_s = previous_log_timestamp > 0 and timestamp > previous_log_timestamp
+			                                 ? double(timestamp - previous_log_timestamp) * 1e-9 : 0.0;
+			const double source_hz = elapsed_s > 0.0
+			                                 ? double(source_updates - previous_logged_source_updates) / elapsed_s : 0.0;
+			previous_logged_source_updates = source_updates;
+			previous_log_timestamp = timestamp;
+			const double raw_rms = raw_step_count > 0
+			                               ? std::sqrt(raw_step_squared_degrees / double(raw_step_count)) : 0.0;
+			const double output_rms = output_step_count > 0
+			                                  ? std::sqrt(output_step_squared_degrees / double(output_step_count)) : 0.0;
 			spdlog::info(
-			        "Steam Frame gaze v8: requests={}, source_updates={}, request_holds={}, hardlocked={}, pending={}, rejected={}, confirmed={}, confirmed_saccades={}, temporal_updates={} (slow={}, medium={}, fast={})",
+			        "Steam Frame gaze v10: requests={}, source_updates={}, source_hz={:.1f}, request_holds={}, hardlocked={}, pending={}, rejected={}, confirmed={}, micro={}, medium={}, confirmed_saccades={}, reacquisitions={}, raw_step_rms_deg={:.3f}, output_step_rms_deg={:.3f}, temporal_updates={} (slow={}, medium={}, fast={})",
 			        requests,
 			        source_updates,
+			        source_hz,
 			        held_requests,
 			        deadband_holds,
 			        pending_changes,
 			        rejected_candidates,
 			        confirmed_moves,
+			        confirmed_micro,
+			        confirmed_medium,
 			        confirmed_saccades,
+			        reacquisitions,
+			        raw_rms,
+			        output_rms,
 			        temporal_updates,
 			        temporal_slow_updates,
 			        temporal_medium_updates,
 			        temporal_fast_updates);
+			raw_step_count = 0;
+			raw_step_squared_degrees = 0.0;
+			output_step_count = 0;
+			output_step_squared_degrees = 0.0;
 			next_log = timestamp + 5'000'000'000;
 		}
 	}
@@ -1063,11 +1228,15 @@ void scenes::stream::tracking()
 	double frame_world_sample_age_sum_ms = 0.0;
 	double frame_world_sample_age_max_ms = 0.0;
 	XrTime frame_world_next_log = 0;
+	XrTime frame_world_last_valid_now = 0;
+	bool frame_world_stale = false;
+	uint64_t frame_world_stale_events = 0;
+	constexpr XrDuration frame_world_stale_timeout_ns = 250'000'000; // 250ms
 
 	if (frame_gaze_fix_enabled())
 	{
 		spdlog::info(
-		        "Steam Frame gaze v8 active: timestamp-corrected world-space binocular mmap + confirmed two-sample hard fixation (0.85/1.50 deg), 144 Hz adaptive temporal (50/25/8 ms)");
+		        "Steam Frame gaze v10 active: timestamp-corrected binocular+monocular world-space mmap with quality hysteresis, adaptive 3-sample micro fixation (1.15/2.40/5.00 deg), 144Hz smoothing and 250ms stale timeout");
 	}
 
 	while (state_ != state::shutdown)
@@ -1246,6 +1415,17 @@ void scenes::stream::tracking()
 
 							if (frame_gaze_fix_enabled() and frame_eye_mmap.active())
 							{
+								// Do not silently swap to a different gaze source if the
+								// mmap temporarily has no valid sample.
+								used_frame_mmap = true;
+								if (frame_world_last_valid_now > 0 and
+								    instance.now() - frame_world_last_valid_now > frame_world_stale_timeout_ns and
+								    not frame_world_stale)
+								{
+									frame_world_stale = true;
+									++frame_world_stale_events;
+									spdlog::warn("Steam Frame gaze v10 world: no fresh usable eye gaze for >250ms; suppressing stale tracked gaze");
+								}
 								if (auto mmap_sample = frame_eye_mmap.read())
 								{
 									// The private mmap ray is head-relative at its own sample time.
@@ -1254,8 +1434,6 @@ void scenes::stream::tracking()
 									// world space, so natural eye counter-rotation from head motion is
 									// not mistaken for gaze drift. Every requested output is converted
 									// back to head-relative using the head pose at tracking.timestamp.
-									used_frame_mmap = true;
-
 									const auto current_head_pose = locate_space(
 									        device_id::HEAD,
 									        view_space,
@@ -1297,6 +1475,13 @@ void scenes::stream::tracking()
 													frame_world_gaze = glm::normalize(*sample_head * head_relative_gaze);
 													frame_world_gaze_sequence = mmap_sample->sequence;
 													frame_world_gaze_have_sequence = true;
+													frame_world_last_valid_now = instance.now();
+													if (frame_world_stale)
+													{
+														gaze_stabilizer.reset_after_tracking_loss();
+														frame_world_stale = false;
+												spdlog::info("Steam Frame gaze v10 world: tracking reacquired; fixation reset");
+													}
 
 													const double age_ms = age_seconds * 1000.0;
 													frame_world_sample_age_sum_ms += age_ms;
@@ -1320,7 +1505,7 @@ void scenes::stream::tracking()
 										}
 									}
 
-									if (frame_world_gaze and current_head)
+									if (frame_world_gaze and current_head and not frame_world_stale)
 									{
 										using flags = from_headset::pose_flags;
 										from_headset::tracking::pose gaze_pose{
@@ -1375,13 +1560,18 @@ void scenes::stream::tracking()
 										        frame_world_compensated_samples > 0
 										                ? frame_world_sample_age_sum_ms / double(frame_world_compensated_samples)
 										                : 0.0;
+										const double last_valid_age_ms = frame_world_last_valid_now > 0
+										        ? double(instance.now() - frame_world_last_valid_now) * 1e-6 : -1.0;
 										spdlog::info(
-										        "Steam Frame gaze v8 world: compensated_samples={}, reprojections={}, failures={}, sample_age_avg={:.2f} ms, sample_age_max={:.2f} ms",
+										        "Steam Frame gaze v10 world: compensated_samples={}, reprojections={}, failures={}, sample_age_avg={:.2f} ms, sample_age_max={:.2f} ms, last_valid_age_ms={:.1f}, stale={}, stale_events={}",
 										        frame_world_compensated_samples,
 										        frame_world_reprojections,
 										        frame_world_compensation_failures,
 										        average_age_ms,
-										        frame_world_sample_age_max_ms);
+										        frame_world_sample_age_max_ms,
+										        last_valid_age_ms,
+										        frame_world_stale,
+										        frame_world_stale_events);
 										frame_world_next_log = tracking.timestamp + 5'000'000'000;
 									}
 								}
