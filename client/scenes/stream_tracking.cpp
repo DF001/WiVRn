@@ -102,6 +102,17 @@ private:
 	static constexpr float eye_lost_threshold = 0.004f;
 	static constexpr float eye_found_threshold = 0.0025f;
 	static constexpr uint32_t recovery_samples_required = 3;
+	static constexpr uint32_t v13_mono_transition_samples_required = 3;
+	static constexpr float v13_mono_transition_max_degrees = 2.0f;
+
+	static bool v13_monocular_enabled()
+	{
+		static const bool enabled = [] {
+			const char * value = std::getenv("WIVRN_FRAME_V13_MONOCULAR");
+			return value != nullptr and std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
 
 	int fd = -1;
 	uint8_t * data = nullptr;
@@ -118,6 +129,10 @@ private:
 	double last_good_sample_time_raw = 0.0;
 	uint32_t last_good_sequence = 0;
 	source current_source = source::held;
+	source last_accepted_source = source::combined;
+	std::optional<source> pending_transition;
+	uint32_t pending_transition_samples = 0;
+	uint64_t rejected_mono_jumps = 0;
 	std::optional<source> last_logged_source;
 
 	template <typename T>
@@ -231,25 +246,25 @@ private:
 		{
 			case source::combined:
 				spdlog::info(
-				        "Steam Frame gaze v10 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v11 source: COMBINED POST (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::left:
 				spdlog::info(
-				        "Steam Frame gaze v10 source: LEFT ONLY (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v11 source: LEFT ONLY (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::right:
 				spdlog::info(
-				        "Steam Frame gaze v10 source: RIGHT ONLY (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v11 source: RIGHT ONLY (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
 			case source::held:
 				spdlog::warn(
-				        "Steam Frame gaze v10 source: HOLD last stable gaze (left_unc={:.6f}, right_unc={:.6f})",
+				        "Steam Frame gaze v11 source: HOLD last stable gaze (left_unc={:.6f}, right_unc={:.6f})",
 				        left_unc,
 				        right_unc);
 				break;
@@ -261,14 +276,14 @@ private:
 		fd = ::open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 		{
-			spdlog::warn("Steam Frame gaze v10: cannot open {}: {}", path, std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v11: cannot open {}: {}", path, std::strerror(errno));
 			return false;
 		}
 
 		struct stat st{};
 		if (fstat(fd, &st) != 0)
 		{
-			spdlog::warn("Steam Frame gaze v10: fstat failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v11: fstat failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -278,7 +293,7 @@ private:
 		if (size < expected_size)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v10: eye mmap too small ({} bytes, need at least {})",
+			        "Steam Frame gaze v11: eye mmap too small ({} bytes, need at least {})",
 			        size,
 			        expected_size);
 			::close(fd);
@@ -289,7 +304,7 @@ private:
 		void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (mapped == MAP_FAILED)
 		{
-			spdlog::warn("Steam Frame gaze v10: mmap failed: {}", std::strerror(errno));
+			spdlog::warn("Steam Frame gaze v11: mmap failed: {}", std::strerror(errno));
 			::close(fd);
 			fd = -1;
 			return false;
@@ -303,7 +318,7 @@ private:
 		if (version != supported_version or initialized != 1)
 		{
 			spdlog::warn(
-			        "Steam Frame gaze v10: unsupported eye mmap (version={}, initialized={})",
+			        "Steam Frame gaze v11: unsupported eye mmap (version={}, initialized={})",
 			        version,
 			        initialized);
 			munmap(data, size);
@@ -315,7 +330,7 @@ private:
 		}
 
 		spdlog::info(
-		        "Steam Frame gaze v10 mmap active: ABI v5 COMBINED POST, hold on single-eye loss, 3-sample recovery");
+		        "Steam Frame gaze v11 mmap active: ABI v5, binocular default, optional guarded monocular fallback");
 		return true;
 	}
 
@@ -394,28 +409,73 @@ public:
 				}
 			}
 
-			// The eye-server reports head-relative POST rays for both eyes. A
-			// failing eye must not freeze tracking while the other eye remains
-			// healthy. Prefer fused binocular gaze; otherwise choose one healthy
-			// POST ray. Preserve conservative per-eye covariance hysteresis.
+			// Safe by default: accept fresh binocular gaze only (V11 policy).
+			// Experimental monocular selection requires explicit opt-in, and
+			// a source transition must pass a short angular/coherence check.
 			std::optional<glm::vec3> candidate = combined;
 			source selected = source::combined;
-			if (not candidate and left_good and left)
+			if (v13_monocular_enabled() and not candidate and left_good and left)
 			{
 				candidate = *left;
 				selected = source::left;
 			}
-			else if (not candidate and right_good and right)
+			else if (v13_monocular_enabled() and not candidate and right_good and right)
 			{
 				candidate = *right;
 				selected = source::right;
 			}
 
-			if (candidate)
+			bool transition_pending = false;
+			if (candidate and last_good_direction and selected != last_accepted_source and
+			    selected != source::combined)
+			{
+				// Only transitions INTO a single-eye source need this guard.
+				// A rejected jump must not move the foveated center.
+				const float d = std::clamp(glm::dot(*candidate, *last_good_direction), -1.0f, 1.0f);
+				const float jump_degrees = std::acos(d) * (180.0f / 3.14159265358979323846f);
+				if (jump_degrees > v13_mono_transition_max_degrees)
+				{
+					transition_pending = true;
+					pending_transition.reset();
+					pending_transition_samples = 0;
+					++rejected_mono_jumps;
+					if (rejected_mono_jumps <= 3 or rejected_mono_jumps % 64 == 0)
+					{
+						spdlog::warn("Steam Frame gaze v11: mono transition rejected: {:.2f} deg, rejects={}",
+						             jump_degrees, rejected_mono_jumps);
+					}
+				}
+				else
+				{
+					if (not pending_transition or *pending_transition != selected)
+					{
+						pending_transition = selected;
+						pending_transition_samples = 1;
+					}
+					else
+					{
+						++pending_transition_samples;
+					}
+					transition_pending = pending_transition_samples < v13_mono_transition_samples_required;
+				}
+			}
+			else
+			{
+				pending_transition.reset();
+				pending_transition_samples = 0;
+			}
+
+			if (transition_pending)
+			{
+				// Keep the last valid gaze during the guard window. Do not
+				// mark this as a fresh accepted source timestamp.
+				current_source = source::held;
+				log_source(current_source, left_unc, right_unc);
+			}
+			else if (candidate)
 			{
 				if (not last_good_direction)
 				{
-					// No previous gaze to hold: accept first usable eye.
 					source_ready = true;
 					recovery_samples = recovery_samples_required;
 				}
@@ -430,9 +490,15 @@ public:
 
 				if (source_ready)
 				{
+					if (selected != last_accepted_source)
+					{
+						spdlog::info("Steam Frame gaze v11: accepted source transition {} -> {}",
+						             int(last_accepted_source), int(selected));
+					}
 					last_good_direction = *candidate;
 					last_good_sample_time_raw = timestamp;
 					last_good_sequence = sequence;
+					last_accepted_source = selected;
 					current_source = selected;
 					log_source(current_source, left_unc, right_unc);
 				}
@@ -615,7 +681,7 @@ class frame_gaze_stabilizer
 	static uint32_t micro_samples_required()
 	{
 		static const uint32_t samples = [] {
-			if (const char * value = std::getenv("WIVRN_FRAME_GAZE_V10_MICRO_SAMPLES"))
+			if (const char * value = std::getenv("WIVRN_FRAME_GAZE_V11_MICRO_SAMPLES"))
 			{
 				const int n = std::atoi(value);
 				if (n >= 2 and n <= 8)
@@ -623,7 +689,7 @@ class frame_gaze_stabilizer
 					return uint32_t(n);
 				}
 			}
-			return uint32_t(3);
+			return uint32_t(5);
 		}();
 		return samples;
 	}
@@ -889,7 +955,7 @@ public:
 			const double output_rms = output_step_count > 0
 			                                  ? std::sqrt(output_step_squared_degrees / double(output_step_count)) : 0.0;
 			spdlog::info(
-			        "Steam Frame gaze v10: requests={}, source_updates={}, source_hz={:.1f}, request_holds={}, hardlocked={}, pending={}, rejected={}, confirmed={}, micro={}, medium={}, confirmed_saccades={}, reacquisitions={}, raw_step_rms_deg={:.3f}, output_step_rms_deg={:.3f}, temporal_updates={} (slow={}, medium={}, fast={})",
+			        "Steam Frame gaze v11: requests={}, source_updates={}, source_hz={:.1f}, request_holds={}, hardlocked={}, pending={}, rejected={}, confirmed={}, micro={}, medium={}, confirmed_saccades={}, reacquisitions={}, raw_step_rms_deg={:.3f}, output_step_rms_deg={:.3f}, temporal_updates={} (slow={}, medium={}, fast={})",
 			        requests,
 			        source_updates,
 			        source_hz,
@@ -1236,7 +1302,7 @@ void scenes::stream::tracking()
 	if (frame_gaze_fix_enabled())
 	{
 		spdlog::info(
-		        "Steam Frame gaze v10 active: timestamp-corrected binocular+monocular world-space mmap with quality hysteresis, adaptive 3-sample micro fixation (1.15/2.40/5.00 deg), 144Hz smoothing and 250ms stale timeout");
+		        "Steam Frame gaze v11 active: V11-safe binocular default, optional guarded monocular fallback, adaptive 5-sample micro fixation (1.15/2.40/5.00 deg), 144Hz smoothing and 250ms stale timeout");
 	}
 
 	while (state_ != state::shutdown)
@@ -1424,7 +1490,7 @@ void scenes::stream::tracking()
 								{
 									frame_world_stale = true;
 									++frame_world_stale_events;
-									spdlog::warn("Steam Frame gaze v10 world: no fresh usable eye gaze for >250ms; suppressing stale tracked gaze");
+									spdlog::warn("Steam Frame gaze v11 world: no fresh usable eye gaze for >250ms; suppressing stale tracked gaze");
 								}
 								if (auto mmap_sample = frame_eye_mmap.read())
 								{
@@ -1480,7 +1546,7 @@ void scenes::stream::tracking()
 													{
 														gaze_stabilizer.reset_after_tracking_loss();
 														frame_world_stale = false;
-												spdlog::info("Steam Frame gaze v10 world: tracking reacquired; fixation reset");
+												spdlog::info("Steam Frame gaze v11 world: tracking reacquired; fixation reset");
 													}
 
 													const double age_ms = age_seconds * 1000.0;
@@ -1563,7 +1629,7 @@ void scenes::stream::tracking()
 										const double last_valid_age_ms = frame_world_last_valid_now > 0
 										        ? double(instance.now() - frame_world_last_valid_now) * 1e-6 : -1.0;
 										spdlog::info(
-										        "Steam Frame gaze v10 world: compensated_samples={}, reprojections={}, failures={}, sample_age_avg={:.2f} ms, sample_age_max={:.2f} ms, last_valid_age_ms={:.1f}, stale={}, stale_events={}",
+										        "Steam Frame gaze v11 world: compensated_samples={}, reprojections={}, failures={}, sample_age_avg={:.2f} ms, sample_age_max={:.2f} ms, last_valid_age_ms={:.1f}, stale={}, stale_events={}",
 										        frame_world_compensated_samples,
 										        frame_world_reprojections,
 										        frame_world_compensation_failures,
