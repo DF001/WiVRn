@@ -1,5 +1,7 @@
 # Star Citizen VR on Linux — Steam Frame Eye Tracking (WiVRn V12 / Gaze Fix V10)
 
+> **⚠️ COMMUNITY REGRESSION REPORT (2026-10-14):** The original V12/Gaze V10 has been reported to feel **significantly worse than V11/Gaze V9** on an actual Steam Frame. The possible causes include unconditional binocular/mono source switching and reduced micro-fixation confirmation (3 vs V11's 5), but neither has been confirmed. **V12 is not recommended as the stable baseline.** Restore V11 for daily use, and test V12 only with backups. An experimental V13 follow-up uses V11-style binocular defaults with opt-in guarded mono fallback.
+
 **Community testing project: experimental Steam Frame eye tracking and gaze-driven foveated streaming for Star Citizen on Linux.**
 
 ## What is this test for?
@@ -201,6 +203,26 @@ Star Citizen: any jumps when switching between binocular and monocular tracking?
 Did Star Citizen MFD text wobble relative to the MFD frame?:
 Client/server logs (personal identifiers removed):
 ```
+
+## V12 regression note: V11 comparison and follow-up V13
+
+This is a **user-reported V12 regression**, not a proven upstream defect. V12 switches directly to a valid single-eye direction when binocular tracking degrades. Since monocular and binocular rays can differ, the foveated region may jump. V12 also accepts small gaze movement after three fresh samples rather than V11's five.
+
+For a focused A/B test, restore V11's confirmation count *without changing V12 mono fallback* by setting this **Steam Frame WiVRn shortcut** launch option, then restarting:
+
+```text
+WIVRN_FRAME_V3=1 WIVRN_FRAME_GAZE_FIX=1 WIVRN_FRAME_GAZE_V10_MICRO_SAMPLES=5 %command%
+```
+
+**Disable the entire V12 experimental gaze fix:**
+
+```text
+WIVRN_FRAME_V3=1 WIVRN_FRAME_GAZE_FIX=0 %command%
+```
+
+This is **not** the same as restoring the V11 executable. To return to the actual V11 implementation, stop WiVRn and restore the saved V11 ARM64 client and compatible assets. Retain the matching host server build.
+
+**V13 / Gaze Fix V11:** Follow-up experimental branch `steam-frame-v13-gaze-v11-community-test` defaults to five-sample confirmation and binocular-only tracking; guarded monocular fallback is independently opt-in. Neither V12 nor V13 is a confirmed fix for the separate Star Citizen MFD texture wobble.
 
 ## 7. Scope / limitations
 
